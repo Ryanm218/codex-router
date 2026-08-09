@@ -156,7 +156,7 @@ The Kimi key must never appear in chat, command arguments, logs, tracked files, 
 
 Kimi K3 global accounts use `https://api.moonshot.ai/v1`, model `kimi-k3`, and `MOONSHOT_API_KEY`/the router's protected key path. The current checked-in `.cn` default is not valid for a global key. Update the `kimi-api` default to the current official global endpoint while preserving the existing allowlisted `KIMI_API_BASE_URL` override for operators who deliberately use another regional endpoint. Add a regression that the generated route and forwarder agree on the global default.
 
-Because changing `.cn` to `.ai` can affect an existing Chinese-platform installation, include a CHANGELOG migration note and a doctor/readiness hint that names the `KIMI_API_BASE_URL` override without exposing its value. Existing regional operators must have a clear recovery path instead of silently losing readiness after update.
+Because changing `.cn` to `.ai` can affect an existing Chinese-platform installation, include a CHANGELOG migration note and a doctor/readiness hint that names the `KIMI_API_BASE_URL` override without exposing its value. Existing regional operators must have a clear recovery path instead of silently losing readiness after update. The allowlisted non-secret override must be rendered into macOS, Linux, and Windows background-service definitions when configured; otherwise it would work in a foreground shell and disappear after installation.
 
 The tray and doctor show only credential presence/source metadata and Kimi balance/readiness. They never read or render the key.
 
@@ -246,12 +246,13 @@ Build the native bundle from the reviewed checkout, open it, and inspect the rea
 After implementation and final review:
 
 1. Keep vision bridge off before first install unless separately requested.
-2. Install only `kimi-api` from the stable checkout, preserving unrelated Codex config and ChatGPT auth.
-3. Run `bin/model-router codex doctor`; all core checks and the fallback check must pass.
-4. Build and persist the tray with `./bin/model-router-tray`, then let Ryan enter the Kimi key directly through its secure field or hidden PTY. Do not rely on `install.sh --with-tray` alone at this pinned version: it builds and opens the app but does not install the current launchd supervision.
-5. Enable quota fallback from the tray.
-6. Tell Ryan to fully quit/reopen Codex and start a new task; the installation task must not quit Codex itself.
-7. Do not run a live Kimi or forced-quota request until Ryan separately approves the billed request.
+2. Let Ryan enter the Kimi key through `./bin/provider-key kimi-api set` in a hidden interactive terminal prompt; never pass it through chat, argv, or logs.
+3. Install only `kimi-api` from the stable checkout, preserving unrelated Codex config and ChatGPT auth. The installer requires the selected provider to be credential-ready.
+4. Run `bin/model-router codex doctor`; all core checks and the fallback check must pass.
+5. Build and persist the tray with `./bin/model-router-tray`. Do not rely on `install.sh --with-tray` alone at this pinned version: it builds and opens the app but does not install the current launchd supervision.
+6. Enable quota fallback from the tray.
+7. Tell Ryan to fully quit/reopen Codex and start a new task; the installation task must not quit Codex itself.
+8. Do not run a live Kimi or forced-quota request until Ryan separately approves the billed request.
 
 ## Rollback
 
