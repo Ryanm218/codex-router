@@ -98,6 +98,7 @@ async function emitProbe() {
     await import("./vision-host.mjs");
   const { readVisionDownload } = await import("./vision-download.mjs");
   const { readBenchmarkResults } = await import("./vision-benchmark.mjs");
+  const { quotaFallbackStatus } = await import("./quota-fallback-status.mjs");
   const { localModelsSnapshot } = await import("./local-models.mjs");
   const { selectedConfiguredListedModels } = await import("./provider-selection.mjs");
   // Bounded and weekly: the tray reads this snapshot constantly, so a fresh
@@ -155,6 +156,7 @@ async function emitProbe() {
               subagents: subagentSettingsSnapshot(),
               picker: modelPickerSnapshot(),
               localModels: localModelsSnapshot({ benchmarks: readBenchmarkResults() }),
+              quotaFallback: quotaFallbackStatus(),
               visionBridge: (() => {
                 const candidates = selectedConfiguredListedModels();
                 const resolved = resolveVisionEngine(
@@ -996,6 +998,37 @@ async function handleNativeRedirect(action, value) {
   process.stdout.write(`${JSON.stringify(setNativeRedirect(value))}\n`);
 }
 
+async function handleQuotaFallback(command) {
+  const { QUOTA_FALLBACK_MODEL, disableQuotaFallback, setQuotaFallback } = await import(
+    "./quota-fallback-state.mjs"
+  );
+  const { quotaFallbackStatus } = await import("./quota-fallback-status.mjs");
+  const jsonStatus = command.length === 2 && command[0] === "status" && command[1] === "--json";
+  const humanStatus = command.length === 0 || (command.length === 1 && command[0] === "status");
+  if (humanStatus || jsonStatus) {
+    const snapshot = quotaFallbackStatus();
+    const last = snapshot.lastOutcome
+      ? `${snapshot.lastOutcome.outcome} at ${snapshot.lastOutcome.at}`
+      : "none";
+    process.stdout.write(jsonStatus
+      ? `${JSON.stringify(snapshot, null, 2)}\n`
+      : `Quota fallback: ${snapshot.enabled ? "on" : "off"}; target ${snapshot.model}; readiness ${snapshot.readiness}; native redirect ${snapshot.nativeRedirectPrecedence ? "takes precedence" : "off"}; last outcome ${last}\n`);
+    return;
+  }
+  if (command.length === 1 && command[0] === "off") {
+    disableQuotaFallback();
+    process.stdout.write(`${JSON.stringify(quotaFallbackStatus())}\n`);
+    return;
+  }
+  if (command.length !== 2 || command[0] !== "set" || command[1] !== QUOTA_FALLBACK_MODEL) {
+    throw new Error("Usage: control quota-fallback status [--json]|set kimi-api/kimi-k3|off");
+  }
+  const readiness = quotaFallbackStatus();
+  if (!readiness.providerReady) throw new Error(readiness.readinessHint);
+  setQuotaFallback(command[1]);
+  process.stdout.write(`${JSON.stringify(quotaFallbackStatus())}\n`);
+}
+
 async function handlePresence(action, value) {
   const { PRESENCE_MODES, presenceSnapshot, setPresenceMode } = await import(
     "./presence-state.mjs"
@@ -1056,6 +1089,8 @@ if (args.includes("--probe")) {
   handleService(args[1]);
 } else if (args[0] === "native-redirect") {
   await handleNativeRedirect(args[1], args[2]);
+} else if (args[0] === "quota-fallback") {
+  await handleQuotaFallback(args.slice(1));
 } else if (args[0] === "tray") {
   handleTray(args[1]);
 } else if (args[0] === "presence") {

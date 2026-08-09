@@ -28,6 +28,7 @@ import {
 import { cliSessionDescriptor } from "./cli-session-credential.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 import { providerNeedsCuration } from "./provider-onboarding.mjs";
+import { quotaFallbackDoctorCheck } from "./quota-fallback-status.mjs";
 import { stateOwnershipStatus } from "./state-owner.mjs";
 import {
   providerSelectionStatus,
@@ -444,6 +445,9 @@ for (const provider of PROVIDERS.values()) {
     );
   }
 }
+
+const quotaFallback = quotaFallbackDoctorCheck();
+add(quotaFallback.status, quotaFallback.name, quotaFallback.detail, quotaFallback.fix);
 
 try {
   const config = childJson("config-manager.mjs", ["status"]);

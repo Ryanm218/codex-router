@@ -12,6 +12,86 @@ export const MAX_BODY_BYTES = Number(
     64 * 1024 * 1024,
 );
 
+// Quota fallback inspects a native error body before deciding whether Kimi
+// may be tried. 64 KiB comfortably covers every provider error body seen in
+// the wild; anything past it is read for shape, not content, and treated as
+// inconclusive rather than buffered in full.
+export const MAX_INSPECTED_ERROR_BYTES = 64 * 1024;
+
+// Read a bounded clone of a fetch Response's body without consuming the
+// original -- the caller still needs to pipe the untouched response to the
+// client whenever inspection concludes fallback should not happen.
+export async function inspectResponseText(
+  response,
+  { maxBytes = MAX_INSPECTED_ERROR_BYTES } = {},
+) {
+  let reader;
+  try {
+    reader = response.clone().body?.getReader();
+    if (!reader) return { complete: true, text: "" };
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        // The untouched original branch has not started draining yet, so
+        // there is nothing to wait on here; cancelling the oversized clone
+        // is a courtesy, not a precondition for returning.
+        void reader.cancel().catch(() => {});
+        return { complete: false };
+      }
+      chunks.push(Buffer.from(value));
+    }
+    return { complete: true, text: Buffer.concat(chunks).toString("utf8") };
+  } catch {
+    if (reader) void reader.cancel().catch(() => {});
+    return { complete: false };
+  }
+}
+
+// Prove a fetch Response has real output ready before the router commits to
+// it: read until the first non-empty chunk, then hand back a replacement
+// Response that starts with that chunk and pumps the rest of the original
+// reader on demand. A pre-first-byte read/abort error is left to reject so
+// the router can tell an aborted client apart from a failed fallback attempt.
+export async function primeResponseBody(response) {
+  if (!response.body) return { started: false };
+  const reader = response.body.getReader();
+  let first;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return { started: false };
+    if (value && value.byteLength > 0) {
+      first = value;
+      break;
+    }
+  }
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(first);
+    },
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+  const primed = new Response(stream, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  return { started: true, response: primed };
+}
+
 export const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "content-encoding",

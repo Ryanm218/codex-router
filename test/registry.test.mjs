@@ -22,6 +22,7 @@ const {
   PROVIDERS,
   readRegistryDocument,
 } = await import("../src/model-registry.mjs");
+const { resolveProviderBaseUrl } = await import("../src/provider-endpoint.mjs");
 
 test("provider registry exposes configured API and OAuth model families", () => {
   // Order follows the deterministic sorted walk of the config/ vendor tree;
@@ -315,6 +316,27 @@ test("Ollama Cloud models advertise only levels Ollama accepts", () => {
       );
     }
   }
+});
+
+test("Kimi API provider resolves the global default and a regional override", () => {
+  const kimi = PROVIDERS.get("kimi-api");
+  assert.equal(kimi.baseUrl, "https://api.moonshot.ai/v1");
+  assert.equal(resolveProviderBaseUrl(kimi, {}), "https://api.moonshot.ai/v1");
+  assert.equal(
+    resolveProviderBaseUrl(kimi, { KIMI_API_BASE_URL: "https://api.moonshot.cn/v1/" }),
+    "https://api.moonshot.cn/v1",
+  );
+  // Whitespace-only is not a real override; the shared resolver falls back
+  // to the registered default instead of forwarding a broken URL.
+  assert.equal(resolveProviderBaseUrl(kimi, { KIMI_API_BASE_URL: "   " }), kimi.baseUrl);
+
+  const kimiBlock = renderLiteLlmConfig()
+    .split(/\n(?=  - model_name: )/)
+    .find((block) => block.startsWith('  - model_name: "kimi-api-k3"'));
+  assert.ok(kimiBlock);
+  assert.match(kimiBlock, /model: "openai\/kimi-api-k3"/);
+  assert.match(kimiBlock, /api_base: "os\.environ\/CODEX_ROUTER_API_FORWARD_BASE_URL"/);
+  assert.match(kimiBlock, /use_chat_completions_api: true/);
 });
 
 test("LiteLLM configuration is generated from every registry route", () => {

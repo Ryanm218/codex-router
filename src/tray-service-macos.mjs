@@ -51,7 +51,14 @@ function plist() {
   <integer>10</integer>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
-</dict>
+${process.env.KIMI_API_BASE_URL
+    ? `  <key>EnvironmentVariables</key>
+  <dict>
+    <key>KIMI_API_BASE_URL</key>
+    <string>${xml(process.env.KIMI_API_BASE_URL)}</string>
+  </dict>
+`
+    : ""}</dict>
 </plist>
 `;
 }

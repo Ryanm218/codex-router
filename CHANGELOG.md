@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+- **Kimi K3 can automatically stand in when ChatGPT's own quota is exhausted.**
+  Opt in with `./bin/control quota-fallback set kimi-api/kimi-k3`; ChatGPT
+  remains primary, and the router only switches a turn to Kimi after a
+  confirmed, structured, terminal account-quota error on a portable
+  `/responses` request that has not yet sent Codex any bytes — never for rate
+  limits, context limits, a partial stream, or a task carrying opaque native
+  history (an active compaction or a delegated-subagent relay). A configured
+  `native-redirect` takes precedence and pauses automatic fallback, since it
+  already moves native turns off ChatGPT on its own terms. Check current state
+  with `./bin/control quota-fallback status`, and turn it off at any time with
+  `./bin/control quota-fallback off` — this only stops future automatic
+  switches and never touches Kimi's own connection or credential. The doctor
+  reports a `Quota fallback` row, and the tray adds one Settings toggle before
+  Providers. `providerReady` means only that Kimi K3 is registered, the
+  provider is selected, and a persistent credential is present — it does not
+  verify a live inference or that the account holds K3 entitlement, and the
+  router performs no billed smoke test by default. See the [global K3
+  quickstart](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart) for
+  account setup.
+- **The Kimi Platform API provider's default endpoint moved from
+  `api.moonshot.cn` to the global `api.moonshot.ai`.** This is a migration,
+  not a credential change: existing stored Kimi API keys are untouched, and
+  operators who deliberately use the `.cn` regional endpoint keep working by
+  setting `KIMI_API_BASE_URL=https://api.moonshot.cn/v1` and rerunning
+  `install.sh` — the background service bakes the value in at install time, so
+  a plain service restart alone does not pick up a change. Kimi Code OAuth is
+  unaffected.
+
 - **Text-only models can answer about a pasted image.** A model with no image
   input — DeepSeek, GLM, Kimi — used to refuse the paste outright. When the
   vision bridge is on, a vision model you already have reads the image and

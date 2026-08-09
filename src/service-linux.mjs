@@ -60,6 +60,7 @@ function unit() {
     CODEX_ROUTER_PORT: String(PORTS.router),
     CODEX_ROUTER_API_PORT: String(PORTS.api),
     ...(process.env.KIMI_CODE_HOME ? { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME } : {}),
+    ...(process.env.KIMI_API_BASE_URL ? { KIMI_API_BASE_URL: process.env.KIMI_API_BASE_URL } : {}),
   };
   return `[Unit]
 Description=${TARGET_DISPLAY_NAME}

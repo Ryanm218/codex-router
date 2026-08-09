@@ -24,25 +24,33 @@ const WRAPPER_PREFIXES = [
 // Providers disagree on where the human-readable message lives: OpenAI-style
 // error.message, bare error strings, top-level message (Alibaba), FastAPI
 // detail, or MiniMax's base_resp.status_msg. The type-ish field (OpenAI type,
-// Google status) rides along for quota classification.
+// Google status) rides along for quota classification. `structured` is true
+// only for a parsed non-array JSON object: quota fallback eligibility must
+// never trust free text that merely sounds like a quota error.
 function parseUpstreamError(bodyText) {
-  if (typeof bodyText !== "string" || !bodyText) return { message: "", type: undefined };
+  if (typeof bodyText !== "string" || !bodyText) {
+    return { message: "", type: undefined, structured: false };
+  }
+  let parsed;
   try {
-    const parsed = JSON.parse(bodyText);
-    const error = parsed?.error;
-    const message =
-      (typeof error === "string" && error) ||
-      (typeof error?.message === "string" && error.message) ||
-      (typeof parsed?.base_resp?.status_msg === "string" && parsed.base_resp.status_msg) ||
-      (typeof parsed?.message === "string" && parsed.message) ||
-      (typeof parsed?.detail === "string" && parsed.detail) ||
-      bodyText;
-    const type = [error?.type, error?.status].find((value) => typeof value === "string");
-    return { message, type };
+    parsed = JSON.parse(bodyText);
   } catch {
     // Non-JSON bodies (HTML gateway pages, plain text) pass through as-is.
-    return { message: bodyText, type: undefined };
+    return { message: bodyText, type: undefined, structured: false };
   }
+  const structured = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed);
+  const error = structured ? parsed.error : undefined;
+  const message =
+    (typeof error === "string" && error) ||
+    (typeof error?.message === "string" && error.message) ||
+    (structured && typeof parsed?.base_resp?.status_msg === "string" && parsed.base_resp.status_msg) ||
+    (structured && typeof parsed?.message === "string" && parsed.message) ||
+    (structured && typeof parsed?.detail === "string" && parsed.detail) ||
+    bodyText;
+  const type = structured
+    ? [error?.type, error?.status].find((value) => typeof value === "string")
+    : undefined;
+  return { message, type, structured };
 }
 
 export function extractUpstreamDetail(bodyText) {
@@ -104,16 +112,59 @@ function isPlanEntitlement(detail) {
 }
 
 function isOutOfUsage(detail, errorType) {
-  if (typeof errorType === "string" && /quota|billing|resource_exhausted/i.test(errorType)) {
+  if (typeof errorType === "string" && /quota|billing|resource_exhausted|usage_limit_exceeded/i.test(errorType)) {
     return true;
   }
   return QUOTA_PATTERNS.some((pattern) => pattern.test(detail));
 }
 
+// A structured error's own type/detail can say "authentication" while the
+// message text still contains quota-shaped words (a provider can report both
+// in one body). Checked ahead of quota wording so a rejected key is never
+// read as exhausted usage.
+const AUTHENTICATION_PATTERNS = [
+  /invalid api[_\s]?key/i,
+  /api key.{0,20}(?:invalid|incorrect|missing|rejected)/i,
+  /authentication failed/i,
+  /invalid[_\s]?authentication/i,
+];
+
+function isAuthenticationFailure(detail, errorType) {
+  if (typeof errorType === "string" && /authentication|invalid_api_key/i.test(errorType)) {
+    return true;
+  }
+  return AUTHENTICATION_PATTERNS.some((pattern) => pattern.test(detail));
+}
+
+// The single quota/entitlement/rate-limit/other classification. Quota
+// fallback (native-fallback-policy.mjs) and gateway error translation both
+// consume this instead of keeping separate pattern-matching paths.
+export function classifyUpstreamFailure({ status, bodyText }) {
+  const parsed = parseUpstreamError(bodyText);
+  const detail = extractUpstreamDetail(bodyText);
+  const result = (kind) => ({
+    kind,
+    detail,
+    structured: parsed.structured,
+    ...(parsed.type ? { errorType: parsed.type } : {}),
+  });
+  if (status < 500 && isPlanEntitlement(detail)) {
+    return result("entitlement");
+  }
+  if (status === 401 || (status === 403 && isAuthenticationFailure(detail, parsed.type))) {
+    return result("other");
+  }
+  if (status < 500 && isOutOfUsage(detail, parsed.type)) {
+    return result("quota");
+  }
+  if (status === 429) return result("rate-limit");
+  return result("other");
+}
+
 function describeFailure({
   status,
   detail,
-  errorType,
+  kind,
   modelName,
   providerName,
   providerKind,
@@ -122,13 +173,13 @@ function describeFailure({
   // Ahead of both the quota and the credential branches: an entitlement
   // failure is the only one of the three that neither a top-up nor a new key
   // can resolve, and its wording overlaps with both.
-  if (status < 500 && isPlanEntitlement(detail)) {
+  if (kind === "entitlement") {
     return {
       type: "billing_error",
       message: `${providerName} accepted the credential, but this plan does not include the API that serves ${modelName}. Upgrade the plan on your ${providerName} account; re-entering or refreshing the credential will not help.`,
     };
   }
-  if (status < 500 && isOutOfUsage(detail, errorType)) {
+  if (kind === "quota") {
     return {
       type: "billing_error",
       message: `You have run out of usage at ${providerName} for ${modelName}. Top up or check the plan on your ${providerName} account.`,
@@ -189,17 +240,19 @@ export function translateGatewayError({
   providerKind,
   retryAfterSeconds,
 }) {
-  const detail = extractUpstreamDetail(bodyText);
+  const classification = classifyUpstreamFailure({ status, bodyText });
   const failure = describeFailure({
     status,
-    detail,
-    errorType: parseUpstreamError(bodyText).type,
+    detail: classification.detail,
+    kind: classification.kind,
     modelName,
     providerName,
     providerKind,
     retryAfterSeconds,
   });
-  const suffix = detail ? ` (HTTP ${status}: ${detail})` : ` (HTTP ${status})`;
+  const suffix = classification.detail
+    ? ` (HTTP ${status}: ${classification.detail})`
+    : ` (HTTP ${status})`;
   return {
     error: {
       message: `${failure.message}${suffix}`,

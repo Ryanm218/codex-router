@@ -61,6 +61,7 @@ function environmentEntries() {
     CODEX_ROUTER_API_PORT: String(PORTS.api),
   };
   if (process.env.KIMI_CODE_HOME) values.KIMI_CODE_HOME = process.env.KIMI_CODE_HOME;
+  if (process.env.KIMI_API_BASE_URL) values.KIMI_API_BASE_URL = process.env.KIMI_API_BASE_URL;
   return Object.entries(values)
     .map(([key, value]) => `    <key>${xml(key)}</key>\n    <string>${xml(value)}</string>`)
     .join("\n");

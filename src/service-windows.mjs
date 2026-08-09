@@ -54,6 +54,7 @@ function wrapper() {
     PYTHONIOENCODING: "utf-8",
     PYTHONUTF8: "1",
     ...(process.env.KIMI_CODE_HOME ? { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME } : {}),
+    ...(process.env.KIMI_API_BASE_URL ? { KIMI_API_BASE_URL: process.env.KIMI_API_BASE_URL } : {}),
   };
   return `@echo off\r\n${Object.entries(variables)
     .map(([key, value]) => `set "${key}=${cmdEscape(value)}"`)

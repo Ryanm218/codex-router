@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { MODELS, PROVIDERS } from "./model-registry.mjs";
 import { credentialStatus, resolveProviderCredential } from "./provider-credentials.mjs";
+import { resolveProviderBaseUrl } from "./provider-endpoint.mjs";
 
 function option(name) {
   const index = process.argv.indexOf(name);
@@ -21,7 +22,7 @@ async function providerPayload(provider) {
   if (fixture) return JSON.parse(readFileSync(path.resolve(fixture), "utf8"));
   const credential = resolveProviderCredential(provider);
   if (!credential) throw new Error(credentialStatus(provider).setup);
-  const baseUrl = String(process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
+  const baseUrl = resolveProviderBaseUrl(provider);
   const response = await fetch(`${baseUrl}/models`, {
     headers: provider.protocol === "anthropic"
       ? { "x-api-key": credential.value, "anthropic-version": "2023-06-01" }

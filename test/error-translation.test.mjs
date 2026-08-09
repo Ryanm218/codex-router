@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  classifyUpstreamFailure,
   extractUpstreamDetail,
   translateGatewayError,
 } from "../src/error-translation.mjs";
@@ -412,4 +413,65 @@ test("a genuine 403 credential rejection still says so", () => {
   });
   assert.equal(translated.error.type, "authentication_error");
   assert.match(translated.error.message, /rejected the stored credentials/);
+});
+
+test("classifyUpstreamFailure gives entitlement precedence over quota wording", () => {
+  const result = classifyUpstreamFailure({
+    status: 403,
+    bodyText: JSON.stringify({
+      error: {
+        type: "insufficient_quota",
+        message: "Your Go plan does not include API access. Upgrade to Provider or higher.",
+      },
+    }),
+  });
+  assert.equal(result.kind, "entitlement");
+});
+
+test("classifyUpstreamFailure separates quota from transient rate limiting", () => {
+  assert.equal(classifyUpstreamFailure({
+    status: 429,
+    bodyText: JSON.stringify({ error: { type: "insufficient_quota", message: "quota exhausted" } }),
+  }).kind, "quota");
+  assert.equal(classifyUpstreamFailure({
+    status: 429,
+    bodyText: JSON.stringify({ error: { message: "Rate limit exceeded: 10 requests per minute" } }),
+  }).kind, "rate-limit");
+  assert.equal(classifyUpstreamFailure({
+    status: 429,
+    bodyText: JSON.stringify({ error: { type: "usage_limit_exceeded", message: "" } }),
+  }).kind, "quota");
+});
+
+test("classifyUpstreamFailure never treats a 401 as quota", () => {
+  assert.equal(classifyUpstreamFailure({
+    status: 401,
+    bodyText: JSON.stringify({
+      error: { type: "insufficient_quota", message: "invalid API key; quota unavailable" },
+    }),
+  }).kind, "other");
+  assert.equal(classifyUpstreamFailure({
+    status: 403,
+    bodyText: JSON.stringify({
+      error: {
+        type: "invalid_authentication_error",
+        message: "Authentication failed; quota information is unavailable.",
+      },
+    }),
+  }).kind, "other");
+});
+
+test("classifyUpstreamFailure marks only JSON objects as structured", () => {
+  assert.equal(classifyUpstreamFailure({
+    status: 429,
+    bodyText: "quota exhausted",
+  }).structured, false);
+  assert.equal(classifyUpstreamFailure({
+    status: 429,
+    bodyText: '{"error":',
+  }).structured, false);
+  assert.equal(classifyUpstreamFailure({
+    status: 429,
+    bodyText: JSON.stringify({ error: { type: "insufficient_quota" } }),
+  }).structured, true);
 });

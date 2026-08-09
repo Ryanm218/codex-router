@@ -187,6 +187,67 @@ The relay requires an active ChatGPT sign-in because only the native Codex
 backend can open its own opaque payload. In login-free mode the router fails
 closed instead of forwarding unreadable ciphertext to an external provider.
 
+## Quota fallback (Kimi K3)
+
+Opt-in policy (`quota-fallback set kimi-api/kimi-k3`) adds one more branch to
+the native-GPT path in the diagram above, evaluated only after the native
+backend has already answered with a non-2xx status:
+
+```mermaid
+sequenceDiagram
+  participant C as Codex
+  participant R as Router :4102
+  participant G as ChatGPT Codex
+  participant L as LiteLLM :4100
+  participant K as Kimi K3
+
+  C->>R: Capability URL + Responses request + native model
+  R->>G: Allow-listed Codex headers + native model
+  G-->>R: Non-2xx response
+  R->>R: Classify body: structured JSON, terminal quota?
+  alt Not a structured terminal quota error, or already streamed
+    R-->>C: Original ChatGPT response, unchanged
+  else Confirmed terminal quota, request is portable
+    R->>L: Cloned request (continuation fields stripped) + internal key
+    L->>K: Chat Completions request
+    K-->>L: Response
+    alt First byte received
+      L-->>C: Kimi response, as the routed reply
+    else Failed before any byte
+      R-->>C: Original ChatGPT response, unchanged
+    end
+  end
+```
+
+Portability is deliberately narrow. A request qualifies only when it targets
+`/responses` or `/v1/responses`, carries no `compaction_trigger`, and carries
+no compaction payload in `input` except the router's own decodable `kcr1:`
+one — any other compaction item, or any of OpenAI's opaque encrypted state
+(the same `encrypted_content` this document's compaction and
+collaboration-relay sections describe), disqualifies it. Kimi cannot read
+that ciphertext, so a request carrying it is left on the native error
+rather than replayed with silently dropped context. `previous_response_id` and
+`client_metadata` are stripped from the clone sent to Kimi (they name a native
+conversation Kimi cannot continue); the caller's own request object is never
+mutated. A response is not treated as a successful switch until its first byte
+is confirmed, so a Kimi request that fails before streaming anything back
+leaves the original ChatGPT response intact, byte-for-byte, including its
+status and headers.
+
+A SHA-256 digest of the decoded request body, path, and native model bounds
+duplicate Kimi attempts from Codex's own HTTP retry layer: a failed attempt
+blocks further attempts for the same digest for 30 seconds by default
+(`MODEL_ROUTER_QUOTA_FALLBACK_GUARD_MS`), so a burst of identical retries
+costs at most one real Kimi request.
+
+`providerReady` — surfaced through `quota-fallback status`, the doctor, and
+the tray — means only that Kimi K3 is registered in this build, the
+`kimi-api` provider is selected, and a persistent credential resolves. It is
+computed without making a network request, so it does not confirm the
+credential is valid, that the account has K3 entitlement, or that Kimi is
+currently reachable; the first real signal either way is the outcome of an
+actual attempt, visible in `lastOutcome`.
+
 Only registry-proven models are advertised as native v2 spawn-agent overrides
 by default. The Settings tab (desktop panel and macOS tray) exposes two local
 accordions: **Subagent models** controls whether all selected models, or only

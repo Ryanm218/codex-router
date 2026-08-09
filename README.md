@@ -123,7 +123,69 @@ Kimi Code OAuth and Kimi Platform API access are separate authentication and
 billing systems. The two Kimi entries intentionally coexist. Older DeepSeek
 aliases remain hidden compatibility routes and are not advertised to new users.
 
+The Kimi Platform API defaults to the global endpoint,
+`https://api.moonshot.ai/v1`. Operators who deliberately use the `.cn`
+regional endpoint export `KIMI_API_BASE_URL=https://api.moonshot.cn/v1` and
+rerun `install.sh`; a stored Kimi API key keeps working unchanged either way.
+The background service bakes the variable into its rendered
+launchd/systemd/Windows service definition at install time, not read fresh
+from the shell at every request, so a plain service restart alone reuses the
+value already baked in — rerunning the installer is what picks up a change.
 
+### Quota fallback: use Kimi K3 when ChatGPT's quota is exhausted
+
+Opt in with:
+
+```sh
+./bin/control quota-fallback set kimi-api/kimi-k3
+```
+
+ChatGPT stays primary. With fallback enabled, the router only switches a turn
+to Kimi K3 after all of the following hold:
+
+- the native ChatGPT/Codex backend returned a non-2xx response,
+- the response body is a fully parsed, structured JSON error (never a body
+  that merely *reads* like a quota message in free text),
+- that error is a confirmed, terminal account-quota exhaustion — not a rate
+  limit, not a context-length error, and not a partial/interrupted stream,
+- the request is a portable `/responses` call with no opaque native state
+  (an in-flight compaction or a delegated-subagent relay carrying OpenAI's
+  encrypted history cannot be replayed against Kimi and is left on the native
+  error instead), and
+- no bytes of the native response have already reached Codex.
+
+Every other case — rate limits, context limits, a stream that already started,
+a non-portable request, a provider that is not selected or has no stored
+credential — leaves the original ChatGPT response untouched. A separate,
+optional `native-redirect` setting (`./bin/control native-redirect set
+<routed-model-slug>`) that sends Codex's background-agent native traffic to a
+routed model unconditionally takes precedence over quota fallback: it already
+moves those native turns off ChatGPT before they can reach OpenAI at all, so
+there is never a native quota response left for automatic fallback to react
+to, and fallback stays paused while a redirect is configured.
+
+Check current state, turn it off, or inspect the last outcome:
+
+```sh
+./bin/control quota-fallback status
+./bin/control quota-fallback status --json
+./bin/control quota-fallback off
+```
+
+Turning fallback off only stops future automatic switches; it never touches
+Kimi's own connection, credential, or usage history. `./bin/doctor` reports a
+`Quota fallback` row, and the macOS tray adds one Settings toggle, **Use Kimi
+K3 when ChatGPT quota is exhausted**, before the Providers section — disabled
+until Kimi K3 is registered, selected, and credentialed.
+
+`providerReady` means only that Kimi K3 is registered in this build, the
+`kimi-api` provider is selected, and a persistent credential is present. It
+does not verify a live inference, and it does not confirm the account holds
+K3 entitlement: the global Kimi Platform requires at least one successful $1
+top-up before K3 access, and the router performs no billed smoke test by
+default. See the [global K3 quickstart
+guide](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart) for account
+setup.
 
 The Ollama Cloud entries bill through an ollama.com account and can host the
 same model families as other providers under a separate quota. Matching entries

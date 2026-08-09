@@ -81,6 +81,41 @@ test("does not poll account endpoints for disabled providers", async () => {
   assert.ok(Object.values(snapshot).every((account) => account.status === "disabled"));
 });
 
+test("Kimi API account usage selects the global default URL and USD, or the .cn override and CNY", async () => {
+  const previousKey = process.env.KIMI_API_KEY;
+  const previousBase = process.env.KIMI_API_BASE_URL;
+  process.env.KIMI_API_KEY = "TEST_KIMI_USAGE_KEY";
+  delete process.env.KIMI_API_BASE_URL;
+  try {
+    const requestedUrls = [];
+    const balancePayload = {
+      code: 0,
+      status: true,
+      data: { available_balance: 12.5, cash_balance: 10, voucher_balance: 2.5 },
+    };
+    const fetchImpl = async (url) => {
+      requestedUrls.push(url);
+      return { ok: true, json: async () => balancePayload };
+    };
+
+    const global = await providerAccountUsageSnapshot({ providerIds: ["kimi-api"], fetchImpl });
+    assert.equal(requestedUrls.at(-1), "https://api.moonshot.ai/v1/users/me/balance");
+    assert.equal(global["kimi-api"].status, "available");
+    assert.equal(global["kimi-api"].metrics[0].currency, "USD");
+
+    process.env.KIMI_API_BASE_URL = "https://api.moonshot.cn/v1";
+    const regional = await providerAccountUsageSnapshot({ providerIds: ["kimi-api"], fetchImpl });
+    assert.equal(requestedUrls.at(-1), "https://api.moonshot.cn/v1/users/me/balance");
+    assert.equal(regional["kimi-api"].status, "available");
+    assert.equal(regional["kimi-api"].metrics[0].currency, "CNY");
+  } finally {
+    if (previousKey === undefined) delete process.env.KIMI_API_KEY;
+    else process.env.KIMI_API_KEY = previousKey;
+    if (previousBase === undefined) delete process.env.KIMI_API_BASE_URL;
+    else process.env.KIMI_API_BASE_URL = previousBase;
+  }
+});
+
 test("Command Code usage degrades to the Studio link without an account API", async () => {
   delete process.env.COMMAND_CODE_API_KEY;
   delete process.env.COMMANDCODE_API_KEY;

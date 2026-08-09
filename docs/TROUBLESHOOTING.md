@@ -109,6 +109,44 @@ Codex Router reads the official Kimi CLI credential under `$KIMI_CODE_HOME` or
 `~/.kimi-code` and refreshes it under a cross-process lock. Do not copy the OAuth
 token into Codex config, an API-key file, or an environment variable.
 
+## Quota fallback never switches to Kimi
+
+```sh
+./bin/control quota-fallback status --json
+```
+
+Check `readiness` first: `credential-missing` means run
+`./bin/provider-key kimi-api set`; `provider-not-selected` means run
+`./bin/providers enable kimi-api`; `target-not-registered` means update or
+reinstall a router build that has `kimi-api/kimi-k3`. A `ready` readiness with
+`nativeRedirectPrecedence: true` means a configured `native-redirect` is
+pausing automatic fallback on purpose — it already moves matching native
+turns off ChatGPT before they reach OpenAI, so there is never a native quota
+response left for fallback to react to.
+
+`providerReady` is computed without a network request: it does not confirm
+the key is valid or that the account holds K3 entitlement, and the router
+performs no billed smoke test by default. The global Kimi Platform requires
+at least one successful $1 top-up before K3 access — see the [global K3
+quickstart](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart). Check
+`lastOutcome` for what actually happened on the most recent attempt.
+
+Fallback only ever fires for a confirmed, structured, terminal quota error on
+a portable `/responses` request that has not yet streamed anything back to
+Codex — never for a rate limit, a context-length error, a stream already in
+progress, or a task carrying opaque native history (an in-flight compaction or
+a delegated-subagent relay). Those cases are working as intended, not a bug:
+the original ChatGPT response is left exactly as OpenAI sent it.
+
+To stop automatic switching entirely:
+
+```sh
+./bin/control quota-fallback off
+```
+
+This only stops future automatic switches. It never touches Kimi's own
+connection, credential, or usage history.
+
 ## Windows blocks the Grok OAuth CLI
 
 On Windows, first confirm that the installed official CLI can launch:

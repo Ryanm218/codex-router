@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -487,4 +487,175 @@ test("aggregate overview covers every target", () => {
   });
   const overview = JSON.parse(output);
   assert.deepEqual(Object.keys(overview.targets).sort(), ["codex"]);
+});
+
+// --- quota fallback: status, control commands, doctor visibility ----------
+//
+// Every case below runs control.mjs as its own subprocess with an isolated,
+// single-provider Kimi registry (no keychain services, no CLI session) and a
+// scrubbed environment, so no test can ever discover or exercise a real Kimi
+// credential on this machine.
+
+function isolatedKimiRegistry(stateDir, { includeKimi = true } = {}) {
+  const providerDocument = JSON.parse(
+    readFileSync(path.join(root, "config", "kimi", "kimi.json"), "utf8"),
+  );
+  const modelDocument = JSON.parse(
+    readFileSync(path.join(root, "config", "kimi", "api", "kimi-k3.json"), "utf8"),
+  );
+  const provider = structuredClone(
+    providerDocument.providers.find((item) => item.id === "kimi-api"),
+  );
+  provider.credential.keychainServices = [];
+  delete provider.credential.cliSession;
+  const registryPath = path.join(stateDir, "isolated-kimi-registry.json");
+  writeFileSync(
+    registryPath,
+    `${JSON.stringify({
+      version: 1,
+      providers: includeKimi ? [provider] : [],
+      models: includeKimi ? modelDocument.models : [],
+    })}\n`,
+    { mode: 0o600 },
+  );
+  return registryPath;
+}
+
+function quotaControl(stateDir, ...command) {
+  const environment = {
+    ...process.env,
+    CODEX_HOME: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_REGISTRY: isolatedKimiRegistry(stateDir),
+  };
+  for (const name of [
+    "KIMI_API_KEY",
+    "MOONSHOT_API_KEY",
+    "MODEL_ROUTER_SHOW_ALL_MODELS",
+    "CODEX_ROUTER_SHOW_ALL_MODELS",
+  ]) {
+    delete environment[name];
+  }
+  return spawnSync(process.execPath, [path.join(root, "src", "control.mjs"), ...command], {
+    cwd: root,
+    encoding: "utf8",
+    env: environment,
+  });
+}
+
+function readyKimiState(t, { configuredModel } = {}) {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-quota-ready-"));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["kimi-api"] })}\n`,
+    { mode: 0o600 },
+  );
+  writeFileSync(path.join(stateDir, "kimi-api-key.secret"), "TEST_KIMI_KEY\n", {
+    mode: 0o600,
+  });
+  if (configuredModel) {
+    writeFileSync(
+      path.join(stateDir, "config.toml"),
+      `model = ${JSON.stringify(configuredModel)}\n`,
+      { mode: 0o600 },
+    );
+  }
+  return stateDir;
+}
+
+test("quota fallback set fails closed until Kimi is selected and credential-ready", (t) => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-quota-not-ready-"));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const result = quotaControl(stateDir, "quota-fallback", "set", "kimi-api/kimi-k3");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Enable kimi-api|API key/);
+  assert.equal(existsSync(path.join(stateDir, "quota-fallback.json")), false);
+});
+
+test("quota fallback status and probe expose only the safe optional snapshot", (t) => {
+  const stateDir = readyKimiState(t);
+  assert.equal(quotaControl(stateDir, "quota-fallback", "set", "kimi-api/kimi-k3").status, 0);
+  const status = JSON.parse(quotaControl(stateDir, "quota-fallback", "status", "--json").stdout);
+  const probe = JSON.parse(quotaControl(stateDir, "--probe").stdout);
+  assert.equal(status.readiness, "ready");
+  assert.deepEqual(probe.modelSettings.quotaFallback, status);
+  assert.doesNotMatch(JSON.stringify(status), /path|source|secret|TEST_KIMI_KEY/i);
+});
+
+test("quota fallback off leaves Kimi selected and the configured Codex model unchanged", (t) => {
+  const stateDir = readyKimiState(t, { configuredModel: "gpt-5.6-sol" });
+  const selectionBefore = readFileSync(path.join(stateDir, "enabled-providers.json"), "utf8");
+  const configBefore = readFileSync(path.join(stateDir, "config.toml"), "utf8");
+  assert.equal(quotaControl(stateDir, "quota-fallback", "set", "kimi-api/kimi-k3").status, 0);
+  assert.equal(quotaControl(stateDir, "quota-fallback", "off").status, 0);
+  assert.equal(readFileSync(path.join(stateDir, "enabled-providers.json"), "utf8"), selectionBefore);
+  assert.equal(readFileSync(path.join(stateDir, "config.toml"), "utf8"), configBefore);
+});
+
+test("quota fallback status human output names on/off, target, readiness, and last outcome", (t) => {
+  const stateDir = readyKimiState(t);
+  assert.equal(quotaControl(stateDir, "quota-fallback", "set", "kimi-api/kimi-k3").status, 0);
+  const human = quotaControl(stateDir, "quota-fallback", "status");
+  assert.equal(human.status, 0);
+  assert.match(human.stdout, /Quota fallback: on; target kimi-api\/kimi-k3; readiness ready/);
+  assert.match(human.stdout, /last outcome none/);
+});
+
+test("quota fallback rejects unknown subcommands and malformed set targets", (t) => {
+  const stateDir = readyKimiState(t);
+  const usage = /Usage: control quota-fallback status \[--json\]\|set kimi-api\/kimi-k3\|off/;
+  assert.match(quotaControl(stateDir, "quota-fallback", "bogus").stderr, usage);
+  assert.match(quotaControl(stateDir, "quota-fallback", "set", "not-kimi/model").stderr, usage);
+  assert.match(quotaControl(stateDir, "quota-fallback", "set").stderr, usage);
+  assert.match(quotaControl(stateDir, "quota-fallback", "status", "--json", "extra").stderr, usage);
+});
+
+test("quota fallback reports target-not-registered against a registry that omits Kimi", (t) => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-quota-no-target-"));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const environment = {
+    ...process.env,
+    CODEX_HOME: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_REGISTRY: isolatedKimiRegistry(stateDir, { includeKimi: false }),
+  };
+  for (const name of ["KIMI_API_KEY", "MOONSHOT_API_KEY"]) delete environment[name];
+  const result = spawnSync(
+    process.execPath,
+    [path.join(root, "src", "control.mjs"), "quota-fallback", "status", "--json"],
+    { cwd: root, encoding: "utf8", env: environment },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const status = JSON.parse(result.stdout);
+  assert.equal(status.readiness, "target-not-registered");
+  assert.equal(status.providerReady, false);
+});
+
+test("quota fallback doctor row reflects readiness without ever touching a real credential", (t) => {
+  const stateDir = readyKimiState(t);
+  assert.equal(quotaControl(stateDir, "quota-fallback", "set", "kimi-api/kimi-k3").status, 0);
+  const environment = {
+    ...process.env,
+    CODEX_HOME: stateDir,
+    MODEL_ROUTER_TARGET: "codex",
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_REGISTRY: isolatedKimiRegistry(stateDir),
+  };
+  for (const name of ["KIMI_API_KEY", "MOONSHOT_API_KEY"]) delete environment[name];
+  const doctor = spawnSync(process.execPath, [path.join(root, "src", "doctor.mjs"), "--json"], {
+    cwd: root,
+    encoding: "utf8",
+    env: environment,
+    timeout: 120_000,
+  });
+  // Unrelated checks (native Codex config, other providers) can fail in this
+  // isolated state dir; only the Quota fallback row itself is under test.
+  const parsed = JSON.parse(doctor.stdout);
+  const check = parsed.checks.find((item) => item.name === "Quota fallback");
+  assert.ok(check, "doctor must report a Quota fallback row");
+  assert.equal(check.status, "ok");
+  assert.match(check.detail, /enabled; Kimi K3 ready/);
 });

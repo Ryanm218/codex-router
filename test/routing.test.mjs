@@ -2827,6 +2827,665 @@ test("native redirect falls back to native when the target cannot route", async 
   }
 });
 
+function readyKimiFallbackStateDir(testRoot, { enabled = true } = {}) {
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(
+    path.join(stateDir, "enabled-providers.json"),
+    `${JSON.stringify({ version: 1, providers: ["kimi-api"] })}\n`,
+    { mode: 0o600 },
+  );
+  writeFileSync(path.join(stateDir, "kimi-api-key.secret"), "TEST_KIMI_KEY\n", { mode: 0o600 });
+  writeFileSync(
+    path.join(stateDir, "quota-fallback.json"),
+    `${JSON.stringify({ version: 1, enabled, model: "kimi-api/kimi-k3" })}\n`,
+    { mode: 0o600 },
+  );
+  return stateDir;
+}
+
+test("quota fallback: a healthy native response stays native with zero Kimi calls", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    json(response, 200, { id: "native-ok", output: [] });
+  });
+  let gatewayRequests = 0;
+  const gateway = await mockServer(async (_request, response) => {
+    gatewayRequests += 1;
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-ok-"));
+  const stateDir = readyKimiFallbackStateDir(testRoot);
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(gatewayRequests, 0);
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("quota fallback: a portable terminal quota error makes exactly one Kimi call", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    json(response, 429, {
+      error: { type: "insufficient_quota", message: "You exceeded your current quota." },
+    });
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, {
+      id: "resp-kimi",
+      object: "response",
+      output: [{ type: "message", content: [{ type: "output_text", text: "from kimi" }] }],
+    });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-hit-"));
+  const stateDir = readyKimiFallbackStateDir(testRoot);
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const requestPayload = {
+      model: "gpt-5.6-sol",
+      previous_response_id: "resp_native",
+      client_metadata: { workspace: "private" },
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] }],
+    };
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestPayload),
+    });
+
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(gatewayRequests.length, 1);
+    assert.equal(gatewayRequests[0].model, "kimi-api-k3");
+    assert.deepEqual(gatewayRequests[0].input, requestPayload.input);
+    assert.equal(gatewayRequests[0].previous_response_id, undefined);
+    assert.equal(gatewayRequests[0].client_metadata, undefined);
+    // The clone strips continuation fields; the caller's own object is untouched.
+    assert.equal(requestPayload.previous_response_id, "resp_native");
+
+    // Usage attribution: exactly one model-usage row, under the Kimi model,
+    // plus the one fallback-control row -- never a row for the rejected
+    // native attempt, and never a double count from Codex's own retry layer.
+    const events = await waitForUsageEvents(stateDir, 2, router);
+    const usageRows = events.filter((event) => event.eventKind !== "quota-fallback");
+    const controlRows = events.filter((event) => event.eventKind === "quota-fallback");
+    assert.equal(usageRows.length, 1);
+    assert.equal(usageRows[0].model, "kimi-api/kimi-k3");
+    assert.equal(usageRows[0].provider, "kimi-api");
+    assert.equal(usageRows[0].status, 200);
+    assert.equal(usageRows.some((row) => row.provider === "openai"), false);
+    assert.equal(controlRows.length, 1);
+    assert.equal(controlRows[0].outcome, "succeeded");
+    assert.equal(controlRows[0].fallbackProvider, "kimi-api");
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("quota fallback: a directly selected external route keeps its own previous_response_id", async () => {
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-direct-"));
+  const stateDir = readyKimiFallbackStateDir(testRoot);
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "kimi-api/kimi-k3",
+        previous_response_id: "resp_external_owned",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(gatewayRequests.length, 1);
+    assert.equal(gatewayRequests[0].previous_response_id, "resp_external_owned");
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("quota fallback: quota-looking plain text never triggers a switch", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    // Not JSON: classifyUpstreamFailure must mark this unstructured, and the
+    // router must never trust free text into spending a Kimi request.
+    response.writeHead(429, { "Content-Type": "text/plain" });
+    response.end("insufficient_quota: you exceeded your current quota");
+  });
+  let gatewayRequests = 0;
+  const gateway = await mockServer(async (_request, response) => {
+    gatewayRequests += 1;
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-unstructured-"));
+  const stateDir = readyKimiFallbackStateDir(testRoot);
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      }),
+    });
+    assert.equal(response.status, 429);
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(gatewayRequests, 0);
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("quota fallback: disabled by default, native quota error passes through unchanged", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    json(response, 429, {
+      error: { type: "insufficient_quota", message: "You exceeded your current quota." },
+    });
+  });
+  let gatewayRequests = 0;
+  const gateway = await mockServer(async (_request, response) => {
+    gatewayRequests += 1;
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  // No quota-fallback.json at all: the state module defaults to disabled.
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-default-off-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      }),
+    });
+    assert.equal(response.status, 429);
+    const body = await response.json();
+    assert.equal(body.error.type, "insufficient_quota");
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(gatewayRequests, 0);
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("quota fallback: every non-quota native failure makes zero Kimi calls", async () => {
+  const cases = [
+    { name: "plain 429", status: 429, body: { error: { message: "rate limit exceeded" } } },
+    {
+      name: "entitlement 403",
+      status: 403,
+      body: { error: { message: "plan does not include API access; upgrade your plan" } },
+    },
+    {
+      name: "context 400",
+      status: 400,
+      body: { error: { type: "context_length_exceeded", message: "context window exceeded" } },
+    },
+    { name: "auth 401", status: 401, body: { error: { message: "invalid authentication" } } },
+    { name: "overload 503", status: 503, body: { error: { message: "overloaded" } } },
+  ];
+
+  for (const item of cases) {
+    const nativeRequests = [];
+    const native = await mockServer(async (request, response) => {
+      nativeRequests.push(await bodyJson(request));
+      json(response, item.status, item.body);
+    });
+    let gatewayRequests = 0;
+    const gateway = await mockServer(async (_request, response) => {
+      gatewayRequests += 1;
+      json(response, 200, { route: "external" });
+    });
+    const routerPort = await openPort();
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-matrix-"));
+    const stateDir = readyKimiFallbackStateDir(testRoot);
+    const router = run("router.mjs", {
+      CODEX_ROUTER_PORT: String(routerPort),
+      CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+      CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+      CODEX_ROUTER_STATE_DIR: stateDir,
+      CODEX_ROUTER_QUIET: "1",
+    });
+
+    try {
+      await waitFor(`${routerBase(routerPort)}/models`, router);
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer CODEX_CALLER_SECRET",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "gpt-5.6-sol",
+          input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+        }),
+      });
+      assert.equal(response.status, item.status, item.name);
+      assert.deepEqual(await response.json(), item.body, item.name);
+      assert.equal(nativeRequests.length, 1, item.name);
+      assert.equal(gatewayRequests, 0, `${item.name}: Kimi must never be contacted`);
+    } finally {
+      await stopChild(router);
+      await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("quota fallback: every portability rejection returns the native error with zero Kimi calls", async () => {
+  const portablePayload = {
+    model: "gpt-5.6-sol",
+    input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "continue" }] }],
+  };
+  const cases = [
+    { name: "/responses/compact endpoint", pathname: "/responses/compact", body: portablePayload },
+    {
+      name: "trailing compaction_trigger",
+      pathname: "/responses",
+      body: { ...portablePayload, input: [...portablePayload.input, { type: "compaction_trigger" }] },
+    },
+    {
+      name: "unreadable native compaction",
+      pathname: "/responses",
+      body: {
+        ...portablePayload,
+        input: [{ type: "compaction", encrypted_content: "opaque-openai-native-format" }],
+      },
+    },
+    {
+      name: "Fernet agent payload",
+      pathname: "/responses",
+      body: {
+        ...portablePayload,
+        input: [
+          ...portablePayload.input,
+          {
+            type: "agent_message",
+            content: [{ type: "encrypted_content", encrypted_content: "gAAAAABleZ9x_-Abc123==" }],
+          },
+        ],
+      },
+    },
+    {
+      name: "Fernet reasoning ciphertext",
+      pathname: "/responses",
+      body: {
+        ...portablePayload,
+        input: [{ type: "reasoning", encrypted_content: "gAAAAAopaque=" }],
+      },
+    },
+    {
+      name: "missing replay input",
+      pathname: "/responses",
+      body: { model: "gpt-5.6-sol", input: "first turn" },
+    },
+  ];
+
+  for (const item of cases) {
+    const nativeRequests = [];
+    const native = await mockServer(async (request, response) => {
+      nativeRequests.push(await bodyJson(request));
+      json(response, 429, {
+        error: { type: "insufficient_quota", message: "You exceeded your current quota." },
+      });
+    });
+    let gatewayRequests = 0;
+    const gateway = await mockServer(async (_request, response) => {
+      gatewayRequests += 1;
+      json(response, 200, { route: "external" });
+    });
+    const routerPort = await openPort();
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-portability-"));
+    const stateDir = readyKimiFallbackStateDir(testRoot);
+    const router = run("router.mjs", {
+      CODEX_ROUTER_PORT: String(routerPort),
+      CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+      CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+      CODEX_ROUTER_STATE_DIR: stateDir,
+      CODEX_ROUTER_QUIET: "1",
+    });
+
+    try {
+      await waitFor(`${routerBase(routerPort)}/models`, router);
+      const response = await fetch(`${routerBase(routerPort)}${item.pathname}`, {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer CODEX_CALLER_SECRET",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(item.body),
+      });
+      assert.equal(response.status, 429, item.name);
+      const parsed = await response.json();
+      assert.equal(parsed.error.type, "insufficient_quota", item.name);
+      assert.equal(nativeRequests.length, 1, item.name);
+      assert.equal(gatewayRequests, 0, `${item.name}: Kimi must never be contacted`);
+    } finally {
+      await stopChild(router);
+      await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+      rmSync(testRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("quota fallback: native redirect keeps precedence and quota fallback never probes Kimi", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    json(response, 429, {
+      error: { type: "insufficient_quota", message: "You exceeded your current quota." },
+    });
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-redirect-precedence-"));
+  const stateDir = readyKimiFallbackStateDir(testRoot);
+  // native-redirect is a *different* routed target than the quota-fallback
+  // one; when it is configured it must win, even though it has nothing to do
+  // with quota.
+  writeFileSync(
+    path.join(stateDir, "native-redirect.json"),
+    `${JSON.stringify({ version: 1, model: "kimi-oauth/k3" })}\n`,
+  );
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    // A slug the redirect intercepts before OpenAI is ever contacted -- there
+    // is no native quota response for quota fallback to evaluate at all.
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-5.6-luna", input: "background turn" }),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(nativeRequests.length, 0, "native-redirect must intercept before OpenAI is contacted");
+    assert.equal(gatewayRequests.length, 1);
+    assert.equal(gatewayRequests[0].model, "kimi-oauth-k3");
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("quota fallback: byte-fidelity, the failure guard, and its expiry", async () => {
+  const nativeBody = Buffer.from(
+    JSON.stringify({ error: { type: "insufficient_quota", message: "quota exhausted" } }),
+    "utf8",
+  );
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push(await bodyJson(request));
+    response.writeHead(429, {
+      "Content-Type": "application/json",
+      "Content-Length": String(nativeBody.length),
+      "Retry-After": "123",
+      "X-Test-Native": "preserved",
+    });
+    response.end(nativeBody);
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    // Kimi itself fails (401): the guard should arm on this failed attempt.
+    json(response, 401, { error: { message: "invalid Kimi credential" } });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-guard-"));
+  const stateDir = readyKimiFallbackStateDir(testRoot);
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    // A short-lived guard so the expiry half of this test does not take 30s.
+    MODEL_ROUTER_QUOTA_FALLBACK_GUARD_MS: "200",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const requestBody = {
+      model: "gpt-5.6-sol",
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "identical" }] }],
+    };
+
+    const first = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    const firstBytes = Buffer.from(await first.arrayBuffer());
+    assert.equal(first.status, 429);
+    assert.equal(first.headers.get("retry-after"), "123");
+    assert.equal(first.headers.get("x-test-native"), "preserved");
+    assert.equal(Buffer.compare(firstBytes, nativeBody), 0, "native bytes must survive a failed Kimi attempt exactly");
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(gatewayRequests.length, 1);
+
+    // The identical decoded request, retried immediately (as Codex's own HTTP
+    // layer can do): native is contacted again, but the guard blocks a
+    // second Kimi call for the same digest.
+    const second = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    assert.equal(second.status, 429);
+    assert.equal(nativeRequests.length, 2);
+    assert.equal(gatewayRequests.length, 1, "the cooldown must block a second Kimi call");
+
+    // A different request body is a different guard key: it may attempt Kimi.
+    const different = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...requestBody,
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "not identical" }] }],
+      }),
+    });
+    assert.equal(different.status, 429);
+    assert.equal(gatewayRequests.length, 2);
+
+    // Past the (shortened) guard window, the original request may attempt
+    // Kimi again.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const afterExpiry = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    assert.equal(afterExpiry.status, 429);
+    assert.equal(gatewayRequests.length, 3, "expiry must permit a new attempt");
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("quota fallback: an aborted client stops the Kimi attempt without arming the guard", async () => {
+  const native = await mockServer(async (request, response) => {
+    json(response, 429, {
+      error: { type: "insufficient_quota", message: "You exceeded your current quota." },
+    });
+  });
+  let kimiRequestSeen = false;
+  let kimiSignalAborted = false;
+  const gateway = await mockServer(async (request, response) => {
+    kimiRequestSeen = true;
+    request.once("aborted", () => {
+      kimiSignalAborted = true;
+    });
+    // Hang well past the client's own abort so the test can observe it.
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    if (!response.writableEnded) json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quota-fallback-abort-"));
+  const stateDir = readyKimiFallbackStateDir(testRoot);
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const controller = new AbortController();
+    const pending = fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.6-sol",
+        input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
+      }),
+      signal: controller.signal,
+    });
+
+    const deadline = Date.now() + 2_000;
+    while (!kimiRequestSeen && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(kimiRequestSeen, "the Kimi attempt never started");
+    controller.abort();
+    await assert.rejects(pending);
+
+    const abortDeadline = Date.now() + 2_000;
+    while (!kimiSignalAborted && Date.now() < abortDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(kimiSignalAborted, "the Kimi request signal never closed");
+
+    // No new attempt starts, and the guard was never armed by an abort.
+    const health = await fetch(`http://127.0.0.1:${routerPort}/health`);
+    const activity = (await health.json()).activity;
+    const idleDeadline = Date.now() + 2_000;
+    let latestActivity = activity;
+    while (latestActivity.state !== "idle" && Date.now() < idleDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      latestActivity = (await (await fetch(`http://127.0.0.1:${routerPort}/health`)).json()).activity;
+    }
+    assert.equal(latestActivity.state, "idle");
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 function usageEvents(stateDir) {
   const file = path.join(stateDir, "usage-events.jsonl");
   if (!existsSync(file)) return [];

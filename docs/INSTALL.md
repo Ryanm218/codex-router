@@ -116,6 +116,18 @@ The desktop app and macOS tray expose the same two actions per API provider:
 manages — a key that also lives in the macOS Keychain or in an environment
 variable is reported as still active so you can clear it at the source.
 
+The Kimi Platform API key defaults to the global endpoint,
+`https://api.moonshot.ai/v1`. To keep using the `.cn` regional endpoint,
+export `KIMI_API_BASE_URL=https://api.moonshot.cn/v1` before running
+`install.sh`; the background service bakes the variable into its rendered
+launchd/systemd/Windows service definition at install time, so changing it
+afterward has no effect until you rerun the installer with the new value
+exported — a plain service restart reuses the value already baked in. The
+stored key itself does not change either way. Optionally enable Kimi K3 as an
+automatic fallback for when ChatGPT's own quota is exhausted with
+`./bin/control quota-fallback set kimi-api/kimi-k3` — see the main README for
+what qualifies and how to turn it back off.
+
 Grok OAuth uses the official Grok CLI session:
 
 ```sh

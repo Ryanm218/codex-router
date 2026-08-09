@@ -18,7 +18,9 @@ import {
   endStreamedResponse,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
+  inspectResponseText,
   pipeResponse,
+  primeResponseBody,
   readRequestBody,
   writeJson,
 } from "./http-utils.mjs";
@@ -33,10 +35,17 @@ import { createHealthCache } from "./health-cache.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
 import {
+  cloneNativePayloadForFallback,
+  createFallbackFailureGuard,
+  nativeFallbackPortability,
+} from "./native-fallback-policy.mjs";
+import { resolveProviderCredential } from "./provider-credentials.mjs";
+import {
   canonicalProviderId,
   readProviderSelection,
   selectedConfiguredListedModels,
 } from "./provider-selection.mjs";
+import { QUOTA_FALLBACK_MODEL, readQuotaFallbackSettings } from "./quota-fallback-state.mjs";
 import { ResponseUsageTransform, tokenUsageFromPayload } from "./response-usage.mjs";
 import {
   CollaborationToolCallTransform,
@@ -44,8 +53,8 @@ import {
   flattenCollaborationNamespaceTools,
 } from "./collaboration-namespace.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
-import { translateGatewayError } from "./error-translation.mjs";
-import { recordUsageEvent } from "./usage-events.mjs";
+import { classifyUpstreamFailure, translateGatewayError } from "./error-translation.mjs";
+import { recordQuotaFallbackEvent, recordUsageEvent } from "./usage-events.mjs";
 import {
   describeImage,
   evidenceCache,
@@ -116,6 +125,14 @@ const AGENT_PAYLOAD_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 const AGENT_PAYLOAD_CACHE_MAX_ENTRIES = 256;
 const agentPayloadCache = new Map();
 let agentPayloadCacheBytes = 0;
+
+// One process-lifetime guard: bounds how many times a single logical request
+// can reach Kimi when Codex retries a failed HTTP call at its own layer. The
+// duration is overridable only so tests can observe expiry without a real
+// 30-second wait; production always gets the 30s default.
+const QUOTA_FALLBACK_GUARD_MS =
+  Number(process.env.MODEL_ROUTER_QUOTA_FALLBACK_GUARD_MS) || 30_000;
+const quotaFallbackGuard = createFallbackFailureGuard({ guardMs: QUOTA_FALLBACK_GUARD_MS });
 
 let requestSequence = 0;
 const activeRequests = new Map();
@@ -1062,6 +1079,263 @@ function requireCodexTransport(request, response) {
   return true;
 }
 
+// Shared preparation for any request going to the routed gateway, whether
+// that is the model Codex actually asked for or the Kimi quota-fallback
+// target standing in for a native call. Never mutates `payload` -- the
+// fallback caller passes a clone, but the ordinary caller passes the live
+// request payload, and mutating it here would be a surprising side effect on
+// a value the caller still owns.
+async function prepareRoutedRequest({ request, payload, route, signal }) {
+  const input = await bridgeVisionInput(
+    await normalizeRoutedAgentInput(request, payload.input, signal),
+    route,
+    signal,
+  );
+  const provider = providerForModel(route);
+  // LiteLLM's Responses -> Chat Completions bridge drops namespace tools.
+  // Chat-completions providers need the collaboration namespace flattened
+  // into ordinary functions; the response transform maps calls back.
+  const flattened =
+    provider?.protocol === "openai-responses"
+      ? { flattened: false, tools: payload.tools }
+      : flattenCollaborationNamespaceTools(payload.tools);
+  const routed = {
+    ...payload,
+    model: route.gatewayModel,
+    // The stored call history must use the same tool names as the tool
+    // list, or the model copies the bare names out of its own transcript.
+    input: flattened.flattened ? flattenCollaborationHistory(input) : input,
+    ...(flattened.flattened ? { tools: flattened.tools } : {}),
+  };
+  // Native OpenAI traffic keeps client_metadata; routed providers do not
+  // consume it and the strict ones reject the unknown field.
+  delete routed.client_metadata;
+  // Codex sends reasoning as an object. LiteLLM's Ollama path tests that
+  // value for membership of a string set, which raises on a dict and fails
+  // the whole turn -- 210 of them here before this was caught. Ollama has
+  // no reasoning-effort concept to map it onto anyway, so drop it rather
+  // than translate it into something the model never asked for.
+  if (provider?.keyless) {
+    delete routed.reasoning;
+    delete routed.reasoning_effort;
+  }
+  return {
+    target: `${GATEWAY_BASE}/responses`,
+    headers: routedHeaders(),
+    body: Buffer.from(JSON.stringify(routed), "utf8"),
+    collaborationFlattened: flattened.flattened,
+  };
+}
+
+// Whether Kimi may be tried after a native, non-2xx response. Every check
+// fails closed: on any doubt this returns undefined and the native response
+// -- untouched -- remains authoritative. Only a portable, classified,
+// structured terminal-quota failure with a ready Kimi credential and an open
+// cooldown window reaches an actual Kimi request.
+async function attemptQuotaFallback({
+  request,
+  requestUrl,
+  payload,
+  decodedBody,
+  requestedModel,
+  nativeUpstream,
+  signal,
+  activity,
+}) {
+  const policy = readQuotaFallbackSettings();
+  if (!policy.enabled) return undefined;
+  // native-redirect converts every native turn to a routed one before OpenAI
+  // is ever contacted, so a native quota response cannot occur under it. A
+  // stale/unregistered redirect target still counts: precedence is about
+  // configuration intent, not about whether that target currently resolves.
+  if (readNativeRedirect()) return undefined;
+
+  const inspected = await inspectResponseText(nativeUpstream);
+  if (!inspected.complete) return undefined;
+  const classification = classifyUpstreamFailure({
+    status: nativeUpstream.status,
+    bodyText: inspected.text,
+  });
+  // The audit fix this policy exists to enforce: a body that merely reads as
+  // a quota error in free text must never switch providers. Only a fully
+  // parsed JSON error object is trustworthy enough to spend a Kimi request.
+  if (classification.kind !== "quota" || !classification.structured) return undefined;
+
+  const fallbackRoute = MODEL_BY_SLUG.get(QUOTA_FALLBACK_MODEL);
+  const fallbackProvider = fallbackRoute ? providerForModel(fallbackRoute) : undefined;
+  const providerReady =
+    fallbackRoute &&
+    fallbackProvider &&
+    readProviderSelection().includes(fallbackRoute.provider) &&
+    Boolean(resolveProviderCredential(fallbackProvider, { persistent: true }));
+  if (!providerReady) {
+    recordQuotaFallbackEvent({
+      nativeProvider: "openai",
+      nativeModel: requestedModel,
+      fallbackProvider: "kimi-api",
+      fallbackModel: QUOTA_FALLBACK_MODEL,
+      errorClass: classification.kind,
+      outcome: "target-unavailable",
+      status: nativeUpstream.status,
+      durationMs: 0,
+    });
+    return undefined;
+  }
+
+  const portability = nativeFallbackPortability({ pathname: requestUrl.pathname, payload });
+  if (!portability.ok) {
+    recordQuotaFallbackEvent({
+      nativeProvider: "openai",
+      nativeModel: requestedModel,
+      fallbackProvider: "kimi-api",
+      fallbackModel: QUOTA_FALLBACK_MODEL,
+      errorClass: classification.kind,
+      outcome: "skipped-nonportable",
+      status: nativeUpstream.status,
+      durationMs: 0,
+    });
+    return undefined;
+  }
+
+  const guardKey = quotaFallbackGuard.keyFor({
+    decodedBody,
+    pathname: requestUrl.pathname,
+    nativeModel: requestedModel,
+  });
+  if (quotaFallbackGuard.isBlocked(guardKey)) {
+    recordQuotaFallbackEvent({
+      nativeProvider: "openai",
+      nativeModel: requestedModel,
+      fallbackProvider: "kimi-api",
+      fallbackModel: QUOTA_FALLBACK_MODEL,
+      errorClass: classification.kind,
+      outcome: "skipped-cooldown",
+      status: nativeUpstream.status,
+      durationMs: 0,
+    });
+    return undefined;
+  }
+
+  const attemptStartedAt = Date.now();
+  const clone = cloneNativePayloadForFallback(payload);
+  const prepared = await prepareRoutedRequest({
+    request,
+    payload: clone,
+    route: fallbackRoute,
+    signal,
+  });
+
+  // Shown optimistically, before Kimi is known to succeed: the tray Island
+  // should track the attempt as it happens, not only its confirmed outcome.
+  activity?.setRoute({
+    provider: canonicalProviderId(fallbackRoute.provider),
+    model: fallbackRoute.slug,
+    routeCause: "quota-fallback",
+    fallbackFromProvider: "openai",
+    fallbackFromModel: requestedModel,
+    ...activityMetadataFromHeaders(request.headers),
+  });
+
+  let kimiUpstream;
+  try {
+    kimiUpstream = await fetch(prepared.target, {
+      method: "POST",
+      headers: prepared.headers,
+      body: prepared.body,
+      signal,
+    });
+  } catch (error) {
+    // An aborted client is not a fallback failure -- propagate it exactly as
+    // the native path already does, with no guard and no telemetry for a
+    // request nobody is waiting on.
+    if (signal.aborted) throw error;
+    quotaFallbackGuard.recordFailure(guardKey);
+    recordQuotaFallbackEvent({
+      nativeProvider: "openai",
+      nativeModel: requestedModel,
+      fallbackProvider: "kimi-api",
+      fallbackModel: QUOTA_FALLBACK_MODEL,
+      errorClass: classification.kind,
+      outcome: "failed",
+      status: nativeUpstream.status,
+      durationMs: Date.now() - attemptStartedAt,
+    });
+    return undefined;
+  }
+
+  if (!kimiUpstream.ok) {
+    void kimiUpstream.body?.cancel?.().catch(() => {});
+    quotaFallbackGuard.recordFailure(guardKey);
+    recordQuotaFallbackEvent({
+      nativeProvider: "openai",
+      nativeModel: requestedModel,
+      fallbackProvider: "kimi-api",
+      fallbackModel: QUOTA_FALLBACK_MODEL,
+      errorClass: classification.kind,
+      outcome: "failed",
+      status: kimiUpstream.status,
+      durationMs: Date.now() - attemptStartedAt,
+    });
+    return undefined;
+  }
+
+  // A 2xx is not yet a successful switch: prime its body before committing
+  // to it, so a stream that ends or throws before the first byte still
+  // leaves the native response as the one Codex sees. A real SSE server
+  // flushes headers well before any body byte, so the network failure this
+  // guards against surfaces here -- as a rejection, exactly like the fetch()
+  // above -- not only as the clean, byte-less end primed.started covers.
+  let primed;
+  try {
+    primed = await primeResponseBody(kimiUpstream);
+  } catch (error) {
+    if (signal.aborted) throw error;
+    quotaFallbackGuard.recordFailure(guardKey);
+    recordQuotaFallbackEvent({
+      nativeProvider: "openai",
+      nativeModel: requestedModel,
+      fallbackProvider: "kimi-api",
+      fallbackModel: QUOTA_FALLBACK_MODEL,
+      errorClass: classification.kind,
+      outcome: "failed",
+      status: kimiUpstream.status,
+      durationMs: Date.now() - attemptStartedAt,
+    });
+    return undefined;
+  }
+  if (!primed.started) {
+    quotaFallbackGuard.recordFailure(guardKey);
+    recordQuotaFallbackEvent({
+      nativeProvider: "openai",
+      nativeModel: requestedModel,
+      fallbackProvider: "kimi-api",
+      fallbackModel: QUOTA_FALLBACK_MODEL,
+      errorClass: classification.kind,
+      outcome: "failed",
+      status: kimiUpstream.status,
+      durationMs: Date.now() - attemptStartedAt,
+    });
+    return undefined;
+  }
+
+  quotaFallbackGuard.clear(guardKey);
+  recordQuotaFallbackEvent({
+    nativeProvider: "openai",
+    nativeModel: requestedModel,
+    fallbackProvider: "kimi-api",
+    fallbackModel: QUOTA_FALLBACK_MODEL,
+    errorClass: classification.kind,
+    outcome: "succeeded",
+    status: kimiUpstream.status,
+    durationMs: Date.now() - attemptStartedAt,
+  });
+  return {
+    route: fallbackRoute,
+    upstream: primed.response,
+    collaborationFlattened: prepared.collaborationFlattened,
+  };
+}
+
 async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
@@ -1157,42 +1431,16 @@ async function handleResponses(request, response, requestUrl) {
     let routedBody;
     let collaborationFlattened = false;
     if (route) {
-      const input = await bridgeVisionInput(
-        await normalizeRoutedAgentInput(request, payload.input, controller.signal),
+      const prepared = await prepareRoutedRequest({
+        request,
+        payload,
         route,
-        controller.signal,
-      );
-      const provider = providerForModel(route);
-      // LiteLLM's Responses -> Chat Completions bridge drops namespace tools.
-      // Chat-completions providers need the collaboration namespace flattened
-      // into ordinary functions; the response transform maps calls back.
-      if (provider?.protocol !== "openai-responses") {
-        const flattened = flattenCollaborationNamespaceTools(payload.tools);
-        collaborationFlattened = flattened.flattened;
-        if (collaborationFlattened) payload.tools = flattened.tools;
-      }
-      const routed = {
-        ...payload,
-        model: route.gatewayModel,
-        // The stored call history must use the same tool names as the tool
-        // list, or the model copies the bare names out of its own transcript.
-        input: collaborationFlattened ? flattenCollaborationHistory(input) : input,
-      };
-      // Native OpenAI traffic keeps client_metadata; routed providers do not
-      // consume it and the strict ones reject the unknown field.
-      delete routed.client_metadata;
-      // Codex sends reasoning as an object. LiteLLM's Ollama path tests that
-      // value for membership of a string set, which raises on a dict and fails
-      // the whole turn -- 210 of them here before this was caught. Ollama has
-      // no reasoning-effort concept to map it onto anyway, so drop it rather
-      // than translate it into something the model never asked for.
-      if (provider?.keyless) {
-        delete routed.reasoning;
-        delete routed.reasoning_effort;
-      }
-      target = `${GATEWAY_BASE}/responses`;
-      headers = routedHeaders();
-      routedBody = Buffer.from(JSON.stringify(routed), "utf8");
+        signal: controller.signal,
+      });
+      target = prepared.target;
+      headers = prepared.headers;
+      routedBody = prepared.body;
+      collaborationFlattened = prepared.collaborationFlattened;
     } else {
       const native = { ...payload };
       if (Array.isArray(payload.input)) {
@@ -1207,7 +1455,7 @@ async function handleResponses(request, response, requestUrl) {
       );
     }
 
-    const upstream = await fetch(target, {
+    let upstream = await fetch(target, {
       method: "POST",
       headers,
       body: routedBody,
@@ -1248,6 +1496,28 @@ async function handleResponses(request, response, requestUrl) {
       }
       return;
     }
+
+    // Quota fallback only ever evaluates a native, non-2xx response. A
+    // successful native call and every routed call skip this seam entirely.
+    let effectiveRoute = route;
+    if (!route && !upstream.ok) {
+      const fallback = await attemptQuotaFallback({
+        request,
+        requestUrl,
+        payload,
+        decodedBody: body,
+        requestedModel,
+        nativeUpstream: upstream,
+        signal: controller.signal,
+        activity,
+      });
+      if (fallback) {
+        upstream = fallback.upstream;
+        effectiveRoute = fallback.route;
+        collaborationFlattened = fallback.collaborationFlattened;
+      }
+    }
+
     // Native OpenAI responses carry the same `usage` shape as routed ones, so
     // meter both paths; without this, native traffic reports zero tokens.
     const usageTransform = new ResponseUsageTransform(
@@ -1260,15 +1530,15 @@ async function handleResponses(request, response, requestUrl) {
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, transforms);
     const usage = usageTransform?.tokenUsage();
     recordUsageEvent({
-      model: route?.slug || requestedModel,
-      provider: route ? canonicalProviderId(route.provider) : "openai",
+      model: effectiveRoute?.slug || requestedModel,
+      provider: effectiveRoute ? canonicalProviderId(effectiveRoute.provider) : "openai",
       status: upstream.status,
       durationMs: Date.now() - startedAt,
       ...usage,
     });
     if (!QUIET) {
       console.error(
-        `[codex-router] model=${requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${upstream.status}`,
+        `[codex-router] model=${requestedModel || "unknown"} provider=${effectiveRoute?.provider || "openai"} status=${upstream.status}`,
       );
     }
   } catch (error) {

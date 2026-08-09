@@ -22,6 +22,7 @@ import {
   credentialStatus,
   resolveProviderCredential,
 } from "./provider-credentials.mjs";
+import { resolveProviderBaseUrl } from "./provider-endpoint.mjs";
 import { VERSION } from "./version.mjs";
 
 const LISTEN_HOST =
@@ -48,10 +49,6 @@ const QUIET =
     (process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1"));
 
 if (!INTERNAL_KEY) throw new Error("MODEL_ROUTER_INTERNAL_KEY is required.");
-
-function providerBaseUrl(provider) {
-  return String(process.env[provider.baseUrlEnv] || provider.baseUrl).replace(/\/+$/, "");
-}
 
 // DeepSeek documents low/high/max (docs also accept xhigh as a compat alias).
 function deepSeekEffort(value) {
@@ -522,7 +519,7 @@ async function handleRequest(request, response) {
   response.once("close", () => {
     if (!response.writableEnded) controller.abort();
   });
-  const target = `${providerBaseUrl(normalized.provider)}${route}${requestUrl.search}`;
+  const target = `${resolveProviderBaseUrl(normalized.provider)}${route}${requestUrl.search}`;
   const upstream = await fetch(target, {
     method: request.method,
     headers: upstreamHeaders(request.headers, normalized.body, credential.value, normalized.provider),

@@ -3,7 +3,13 @@ import http from "node:http";
 import { Transform } from "node:stream";
 import test from "node:test";
 
-import { endStreamedResponse, pipeResponse } from "../src/http-utils.mjs";
+import {
+  endStreamedResponse,
+  inspectResponseText,
+  MAX_INSPECTED_ERROR_BYTES,
+  pipeResponse,
+  primeResponseBody,
+} from "../src/http-utils.mjs";
 
 function listen(server) {
   return new Promise((resolve) => {
@@ -306,4 +312,62 @@ test("endStreamedResponse is a no-op on a finished or destroyed response", async
   await close(server);
 
   assert.equal(result.body, "data: done\n\n");
+});
+
+test("inspectResponseText leaves a small response byte-readable afterward", async () => {
+  const response = new Response('{"error":{"type":"insufficient_quota"}}', {
+    status: 429,
+    headers: { "content-type": "application/json" },
+  });
+  const inspected = await inspectResponseText(response);
+  assert.deepEqual(inspected, {
+    complete: true,
+    text: '{"error":{"type":"insufficient_quota"}}',
+  });
+  // The original must still be readable byte-for-byte: inspection only ever
+  // reads a clone.
+  assert.equal(await response.text(), '{"error":{"type":"insufficient_quota"}}');
+});
+
+test("inspectResponseText returns incomplete for an oversized body without disturbing the original", async () => {
+  const oversized = "x".repeat(MAX_INSPECTED_ERROR_BYTES + 1);
+  const response = new Response(oversized, { status: 500 });
+  const inspected = await inspectResponseText(response);
+  assert.deepEqual(inspected, { complete: false });
+  assert.equal(await response.text(), oversized);
+});
+
+test("primeResponseBody reports not started for an empty body", async () => {
+  const response = new Response("", { status: 200 });
+  assert.deepEqual(await primeResponseBody(response), { started: false });
+});
+
+test("primeResponseBody rejects when the stream fails before its first chunk", async () => {
+  const response = new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(new Error("upstream reset before output"));
+      },
+    }),
+    { status: 200 },
+  );
+  await assert.rejects(primeResponseBody(response), /upstream reset before output/);
+});
+
+test("primeResponseBody's replacement response is byte-identical to the original stream", async () => {
+  const chunks = ["first-chunk-", "second-chunk-", "third-chunk"];
+  const response = new Response(
+    new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+        controller.close();
+      },
+    }),
+    { status: 200, statusText: "OK", headers: { "x-test-native": "preserved" } },
+  );
+  const result = await primeResponseBody(response);
+  assert.equal(result.started, true);
+  assert.equal(result.response.status, 200);
+  assert.equal(result.response.headers.get("x-test-native"), "preserved");
+  assert.equal(await result.response.text(), chunks.join(""));
 });

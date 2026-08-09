@@ -178,6 +178,26 @@ deletes ChatGPT credentials. The mode keeps the current external model when
 possible, otherwise selects the first model from a connected, enabled provider,
 and restores the previous model when switched off.
 
+The **Use Kimi K3 when ChatGPT quota is exhausted** switch, right below
+Update & Verify, enables automatic quota fallback. It is disabled until the
+summary reads ready — Kimi K3 registered in this build, the `kimi-api`
+provider selected, and a key stored — but an already-enabled policy can
+always be turned back off. The label under the switch shows one of: **Off**;
+**Kimi K3 · ready**; **Kimi K3 · needs API key**; **Kimi K3 · provider
+disabled**; **Kimi K3 · not ready** for any other unready reason; or, while a
+`native-redirect` is separately configured, **Paused · native redirect takes
+precedence** — that redirect already moves matching native turns off ChatGPT
+before they can reach OpenAI, so there is never a native quota response for
+fallback to react to while it is active. If the router predates this feature,
+the row reads **Unavailable · update router** instead of failing to load.
+Turning the switch on or off shows a small progress indicator and disables
+other provider actions until it completes; a failure restores the previous
+on/off state and shows a plain message — never a raw process or credential
+error. Toggling only ever changes this one setting: it does not touch Kimi's
+connection, credential, or usage history, and enabling it never makes a
+billed request on its own. See the main README for exactly what qualifies a
+turn to switch.
+
 ## Adding providers and models
 
 The Providers section is also the onboarding surface for every model source in

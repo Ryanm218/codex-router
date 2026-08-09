@@ -89,6 +89,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 }
 
+/// Test seam for `RouterStore.runControl`. Production code always uses the
+/// default (nil) override, which runs `bin/control` as a real subprocess;
+/// only tests construct a `RouterStore` with a scripted runner.
+typealias RouterControlRunner = @Sendable ([String], Data?) async throws -> Data
+
 @MainActor
 final class RouterStore: ObservableObject {
   static let shared = RouterStore()
@@ -136,6 +141,7 @@ final class RouterStore: ObservableObject {
   private var pendingServiceStop: Task<Void, Never>?
   private var serviceWork: Task<Void, Never>?
   private var serviceIntent: ServiceIntent = .unknown
+  private let controlRunnerOverride: RouterControlRunner?
   // Codex relaunches itself to apply updates, so a momentary disappearance must
   // not bounce the router. Wait the absence out and re-check before stopping.
   private let hostAppAbsenceGrace = Duration.seconds(30)
@@ -190,7 +196,11 @@ final class RouterStore: ObservableObject {
     return formatter
   }()
 
-  init() {
+  /// `controlRunnerOverride` is nil in every production path; `RouterStore()`
+  /// via `RouterStore.shared` is unaffected. Only tests pass a scripted
+  /// runner, via `RouterStore(controlRunnerOverride:)`.
+  init(controlRunnerOverride: RouterControlRunner? = nil) {
+    self.controlRunnerOverride = controlRunnerOverride
     selectedUsageProviderID = "openai"
     if let raw = defaults.string(forKey: islandModeKey), let mode = IslandMode(rawValue: raw) {
       islandMode = mode
@@ -215,6 +225,10 @@ final class RouterStore: ObservableObject {
 
   var loginFree: Bool {
     snapshot.targets["codex"]?.loginFree == true
+  }
+
+  var quotaFallback: QuotaFallbackSnapshot? {
+    snapshot.targets["codex"]?.modelSettings?.quotaFallback
   }
 
   var maintenanceRunning: Bool {
@@ -1168,6 +1182,32 @@ final class RouterStore: ObservableObject {
     }
   }
 
+  /// Not routed through `applyModelSettings`: quota fallback needs no
+  /// restart or catalog refresh, only its own probe field to update.
+  func setQuotaFallbackEnabled(_ enabled: Bool) async {
+    guard providerOperation == nil else { return }
+    let previous = quotaFallback
+    providerOperation = "quota-fallback"
+    defer { providerOperation = nil }
+    do {
+      _ = try await runControl(arguments: enabled
+        ? ["quota-fallback", "set", "kimi-api/kimi-k3"]
+        : ["quota-fallback", "off"])
+      await refresh()
+      message = enabled
+        ? "Quota fallback enabled. ChatGPT remains primary."
+        : "Quota fallback disabled. Kimi remains connected."
+    } catch {
+      if previous?.enabled == true {
+        _ = try? await runControl(arguments: ["quota-fallback", "set", previous?.model ?? "kimi-api/kimi-k3"])
+      } else {
+        _ = try? await runControl(arguments: ["quota-fallback", "off"])
+      }
+      await refresh()
+      message = QuotaFallbackViewState(snapshot: quotaFallback).sanitizedFailureMessage
+    }
+  }
+
   private func performProviderOperation(
     _ provider: String,
     successMessage: String,
@@ -1368,6 +1408,9 @@ final class RouterStore: ObservableObject {
   }
 
   private func runControl(arguments: [String], stdin: Data? = nil) async throws -> Data {
+    if let controlRunnerOverride {
+      return try await controlRunnerOverride(arguments, stdin)
+    }
     let root = try sourceRoot()
     return try await Task.detached {
       let task = Process()
@@ -1669,6 +1712,7 @@ struct ModelSettingsSnapshot: Decodable {
   let picker: PickerSettingsSnapshot
   let localModels: LocalModelsSnapshot?
   let visionBridge: VisionBridgeSnapshot?
+  let quotaFallback: QuotaFallbackSnapshot?
 }
 
 struct LocalModelsSnapshot: Decodable {
@@ -2163,6 +2207,7 @@ private struct TrayView: View {
       isDisabled: store.providerOperation != nil
     )
     maintenanceRow
+    QuotaFallbackRow(store: store)
     AccordionPanel(
       title: "Providers",
       summary: store.providerOperation == nil ? "Auto-saved" : "Applying…",
