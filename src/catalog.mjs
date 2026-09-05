@@ -1,20 +1,28 @@
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { protectPrivateFile } from "./file-security.mjs";
+import {
+  privateFileIsProtected,
+  protectPrivateFile,
+} from "./file-security.mjs";
+import { withCatalogOperationLock } from "./catalog-operation-lock.mjs";
+import { acquireNativeCatalog } from "./native-catalog-refresh.mjs";
 import {
   ANNOUNCED_MODELS_PATH,
+  CODEX_HOME,
   CONFIG_PATH,
-  MERGED_CATALOG_PATH,
-  NATIVE_ALIAS_PATH,
   NATIVE_CATALOG_PATH,
+  STATE_DIR,
 } from "./paths.mjs";
 import { codexAuthStatus, codexVersion, runCodex } from "./codex-binary.mjs";
 import { readUserModels } from "./user-models.mjs";
@@ -31,24 +39,9 @@ import { assertStateOwnership } from "./state-owner.mjs";
 import { applyVisionBridge, resolveVisionEngine } from "./vision-bridge.mjs";
 import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
 
-const refresh = process.argv.includes("--refresh-native");
-const bundled = process.argv.includes("--bundled-native");
-
-function atomicJson(target, value) {
-  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
-  const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  protectPrivateFile(temporary);
-  renameSync(temporary, target);
-  protectPrivateFile(target);
-}
-
-function captureNative() {
+function captureNative({ bundledNative = false } = {}) {
   const args = ["debug", "models"];
-  if (bundled) args.push("--bundled");
+  if (bundledNative) args.push("--bundled");
   let output;
   try {
     output = runCodex(args, {
@@ -57,7 +50,7 @@ function captureNative() {
       maxBuffer: 32 * 1024 * 1024,
     });
   } catch (error) {
-    if (bundled) throw error;
+    if (bundledNative) throw error;
     output = runCodex(["debug", "models", "--bundled"], {
       encoding: "utf8",
       timeout: 30_000,
@@ -74,11 +67,10 @@ function captureNative() {
     );
   }
   const capturedWith = codexVersion();
-  atomicJson(NATIVE_CATALOG_PATH, {
+  return {
+    ...parsed,
     ...(capturedWith ? { captured_with: capturedWith } : {}),
-    models: parsed.models,
-  });
-  return parsed;
+  };
 }
 
 // A native capture is only trustworthy for the Codex build that produced it:
@@ -93,12 +85,19 @@ export function nativeCatalogIsReusable(parsed, currentVersion) {
   return !currentVersion || parsed.captured_with === currentVersion;
 }
 
-function nativeCatalog() {
-  if (!existsSync(NATIVE_CATALOG_PATH) || refresh) return captureNative();
+function nativeCatalog({ refreshNative = false, bundledNative = false } = {}) {
+  if (!existsSync(NATIVE_CATALOG_PATH) || refreshNative) {
+    return { candidate: captureNative({ bundledNative }) };
+  }
   const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
-  if (nativeCatalogIsReusable(parsed, codexVersion())) return parsed;
+  if (nativeCatalogIsReusable(parsed, codexVersion())) {
+    return {
+      candidate: parsed,
+      trustedStoredCapturedWith: parsed.captured_with,
+    };
+  }
   try {
-    return captureNative();
+    return { candidate: captureNative({ bundledNative }) };
   } catch (error) {
     // Version-mismatched is still better than empty: serve the stale capture
     // when the re-capture fails, but say so instead of hiding it.
@@ -106,7 +105,10 @@ function nativeCatalog() {
       console.error(
         `Could not refresh the native model catalog (${error.message}); reusing the cached capture.`,
       );
-      return parsed;
+      return {
+        candidate: parsed,
+        trustedStoredCapturedWith: parsed.captured_with,
+      };
     }
     throw error;
   }
@@ -375,10 +377,10 @@ export function annotateNewModelAnnouncements(routedModelsList, announcedAt, use
   return { models, announcedAt: nextAnnouncedAt };
 }
 
-function readAnnouncedAt() {
-  if (!existsSync(ANNOUNCED_MODELS_PATH)) return null;
+function readAnnouncedAt(target = ANNOUNCED_MODELS_PATH) {
+  if (!existsSync(target)) return null;
   try {
-    const parsed = JSON.parse(readFileSync(ANNOUNCED_MODELS_PATH, "utf8"));
+    const parsed = JSON.parse(readFileSync(target, "utf8"));
     if (!parsed || typeof parsed.models !== "object" || Array.isArray(parsed.models)) {
       return null;
     }
@@ -389,13 +391,6 @@ function readAnnouncedAt() {
     // Corrupt state must reseed silently, not announce the whole catalog.
     return null;
   }
-}
-
-function writeAnnouncedAt(announcedAt) {
-  atomicJson(ANNOUNCED_MODELS_PATH, {
-    version: 1,
-    models: Object.fromEntries([...announcedAt.entries()].sort()),
-  });
 }
 
 function sortCatalogModels(models) {
@@ -469,7 +464,474 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
   return { models: sortCatalogModels(models), aliases };
 }
 
-function main() {
+export const DEFAULT_CODEX_APP_BINARY =
+  "/Applications/Codex.app/Contents/Resources/codex";
+
+export function catalogArtifactPaths(stateDir = STATE_DIR) {
+  return {
+    nativeCatalog: path.join(stateDir, "native-models.json"),
+    aliasCatalog: path.join(stateDir, "native-aliases.json"),
+    announcementCatalog: path.join(stateDir, "announced-models.json"),
+    mergedCatalog: path.join(stateDir, "merged-models.json"),
+    captureMetadata: path.join(stateDir, "native-capture-metadata.json"),
+  };
+}
+
+function stripControlledCatalogProvenance(candidate) {
+  return Object.fromEntries(
+    Object.entries(candidate).filter(
+      ([key]) => !["captured_with", "etag", "fetched_at"].includes(key),
+    ),
+  );
+}
+
+function catalogDigest(candidate) {
+  return createHash("sha256")
+    .update(JSON.stringify(stripControlledCatalogProvenance(candidate)))
+    .digest("hex");
+}
+
+function assertUniqueModels(models) {
+  if (!Array.isArray(models) || models.length === 0) {
+    throw catalogTransactionError("CATALOG_ARTIFACT_INVALID");
+  }
+  const slugs = models.map((model) => String(model?.slug || ""));
+  if (slugs.some((slug) => !slug) || new Set(slugs).size !== slugs.length) {
+    throw catalogTransactionError("CATALOG_ARTIFACT_INVALID");
+  }
+  return new Set(slugs);
+}
+
+function validateAliasInvariants(mergedModels, aliases) {
+  if (!aliases || typeof aliases !== "object" || Array.isArray(aliases)) {
+    throw catalogTransactionError("CATALOG_ARTIFACT_INVALID");
+  }
+  const bySlug = new Map(mergedModels.map((model) => [String(model.slug), model]));
+  for (const [nativeSlug, routedSlug] of Object.entries(aliases)) {
+    if (
+      typeof routedSlug !== "string" ||
+      !bySlug.has(nativeSlug) ||
+      !bySlug.has(routedSlug) ||
+      bySlug.get(routedSlug).visibility !== "hide"
+    ) {
+      throw catalogTransactionError("CATALOG_ARTIFACT_INVALID");
+    }
+  }
+}
+
+export function buildCatalogArtifacts({
+  candidate,
+  attestation,
+  clientVersion,
+  trustedStoredCapturedWith,
+  routedModels = [],
+  announcedAt = null,
+  userSlugs = new Set(),
+  hiddenModels = new Set(),
+  multiAgentSettings = { mode: "proven", enabled: [], disabled: [] },
+  loginFree = false,
+  openaiAuthenticated = true,
+  now = Date.now(),
+  visionEngine,
+  includeCaptureMetadata = true,
+}) {
+  const configuredRoutedModels = applyMultiAgentSettings(
+    routedModels,
+    multiAgentSettings,
+    hiddenModels,
+  );
+  const announced = annotateNewModelAnnouncements(
+    clampModelEfforts(
+      configuredRoutedModels,
+      codexEffortVocabulary(clientVersion),
+    ),
+    announcedAt,
+    userSlugs,
+    now,
+  );
+  const catalogModels = applyVisionBridge(announced.models, visionEngine);
+  const nativeCatalog = {
+    ...stripControlledCatalogProvenance(candidate),
+    ...(trustedStoredCapturedWith || clientVersion
+      ? { captured_with: trustedStoredCapturedWith || clientVersion }
+      : {}),
+  };
+  const native = {
+    ...nativeCatalog,
+    models: promoteNativeMultiAgent(
+      candidate.models,
+      multiAgentSettings,
+      hiddenModels,
+    ),
+  };
+  const built = loginFree
+    ? buildLoginFreeCatalog(native, catalogModels)
+    : {
+        models: buildMergedCatalog(native, catalogModels, {
+          includeNative: openaiAuthenticated,
+        }),
+        aliases: {},
+      };
+  const mergedModels = built.models.map((model) =>
+    hiddenModels.has(String(model.slug))
+      ? { ...model, visibility: "hide" }
+      : model,
+  );
+  assertUniqueModels(nativeCatalog.models);
+  assertUniqueModels(mergedModels);
+  validateAliasInvariants(mergedModels, built.aliases);
+
+  const captureMetadata = includeCaptureMetadata
+    ? {
+        version: 1,
+        digest: catalogDigest(candidate),
+        captured_with: clientVersion,
+        ...(typeof attestation?.etag === "string" ? { etag: attestation.etag } : {}),
+        ...(typeof attestation?.fetchedAt === "string"
+          ? { fetched_at: attestation.fetchedAt }
+          : {}),
+        captured_at: new Date(now).toISOString(),
+      }
+    : undefined;
+
+  return {
+    nativeCatalog,
+    aliasCatalog: { version: 1, aliases: built.aliases },
+    announcementCatalog: {
+      version: 1,
+      models: Object.fromEntries([...announced.announcedAt.entries()].sort()),
+    },
+    mergedCatalog: { models: mergedModels },
+    captureMetadata,
+    routedModels: announced.models,
+    catalogModels,
+    summary: {
+      models: mergedModels.length,
+      routedModels: announced.models.length,
+      aliasedModels: Object.keys(built.aliases).length,
+      nativeModels: !loginFree && openaiAuthenticated
+        ? mergedModels.filter((model) => !MODEL_BY_SLUG.has(String(model.slug))).length
+        : 0,
+      loginFree,
+      openaiAuthenticated,
+      visionBridgeEngine: visionEngine?.slug || null,
+      visionBridgedModels: catalogModels.filter(
+        (model) => model.visionBridgeEngine !== undefined,
+      ).length,
+    },
+  };
+}
+
+function catalogTransactionError(code, cause) {
+  const error = new Error(`Catalog transaction failed (${code}).`, cause ? { cause } : undefined);
+  error.code = code;
+  return error;
+}
+
+function serializeJson(value) {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+const DEFAULT_CATALOG_FILE_SYSTEM = {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+};
+
+export function validateCatalogArtifacts(artifacts) {
+  if (
+    !artifacts ||
+    !artifacts.nativeCatalog ||
+    !artifacts.aliasCatalog ||
+    !artifacts.announcementCatalog ||
+    !artifacts.mergedCatalog
+  ) {
+    throw catalogTransactionError("CATALOG_ARTIFACT_INVALID");
+  }
+  assertUniqueModels(artifacts.nativeCatalog.models);
+  assertUniqueModels(artifacts.mergedCatalog.models);
+  validateAliasInvariants(
+    artifacts.mergedCatalog.models,
+    artifacts.aliasCatalog.aliases,
+  );
+  if (
+    artifacts.announcementCatalog.version !== 1 ||
+    !artifacts.announcementCatalog.models ||
+    typeof artifacts.announcementCatalog.models !== "object" ||
+    Array.isArray(artifacts.announcementCatalog.models)
+  ) {
+    throw catalogTransactionError("CATALOG_ARTIFACT_INVALID");
+  }
+  if (
+    artifacts.captureMetadata !== undefined &&
+    (artifacts.captureMetadata?.version !== 1 ||
+      !/^[0-9a-f]{64}$/.test(String(artifacts.captureMetadata.digest || "")) ||
+      typeof artifacts.captureMetadata.captured_with !== "string")
+  ) {
+    throw catalogTransactionError("CATALOG_ARTIFACT_INVALID");
+  }
+}
+
+function removeIfPresent(target, fileSystem) {
+  try {
+    fileSystem.unlinkSync(target);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function restoreSnapshot(target, snapshot, fileSystem, protectFile, suffix) {
+  if (!snapshot.exists) {
+    removeIfPresent(target, fileSystem);
+    return;
+  }
+  const restorePath = `${target}.restore.${suffix}`;
+  fileSystem.writeFileSync(restorePath, snapshot.bytes, { mode: 0o600 });
+  protectFile(restorePath);
+  fileSystem.renameSync(restorePath, target);
+}
+
+export function publishCatalogArtifacts(
+  artifacts,
+  {
+    paths = catalogArtifactPaths(),
+    fileSystem: fileSystemOverrides = {},
+    protectFile = protectPrivateFile,
+    privateFileProtected = privateFileIsProtected,
+    platform = process.platform,
+    suffix = `${process.pid}.${randomUUID()}`,
+  } = {},
+) {
+  validateCatalogArtifacts(artifacts);
+  const fileSystem = { ...DEFAULT_CATALOG_FILE_SYSTEM, ...fileSystemOverrides };
+  const orderedKeys = [
+    "nativeCatalog",
+    "aliasCatalog",
+    "announcementCatalog",
+    "mergedCatalog",
+    ...(artifacts.captureMetadata ? ["captureMetadata"] : []),
+  ];
+  const snapshots = Object.fromEntries(
+    orderedKeys.map((key) => {
+      const target = paths[key];
+      const exists = fileSystem.existsSync(target);
+      return [key, {
+        exists,
+        bytes: exists ? fileSystem.readFileSync(target) : undefined,
+      }];
+    }),
+  );
+  const staged = new Map();
+
+  try {
+    for (const key of orderedKeys) {
+      const target = paths[key];
+      fileSystem.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+      const stagePath = `${target}.stage.${suffix}`;
+      staged.set(key, stagePath);
+      fileSystem.writeFileSync(stagePath, serializeJson(artifacts[key]), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      protectFile(stagePath);
+      const metadata = fileSystem.lstatSync(stagePath);
+      const privateMode = platform === "win32" || (metadata.mode & 0o777) === 0o600;
+      if (!metadata.isFile() || !privateMode || !privateFileProtected(stagePath)) {
+        throw catalogTransactionError("CATALOG_STAGE_INVALID");
+      }
+      const parsed = JSON.parse(fileSystem.readFileSync(stagePath, "utf8"));
+      if (JSON.stringify(parsed) !== JSON.stringify(artifacts[key])) {
+        throw catalogTransactionError("CATALOG_STAGE_INVALID");
+      }
+    }
+  } catch (error) {
+    for (const stagePath of staged.values()) {
+      try {
+        removeIfPresent(stagePath, fileSystem);
+      } catch {
+        // A failed stage cleanup cannot make any target less last-known-good.
+      }
+    }
+    throw error?.code ? error : catalogTransactionError("CATALOG_STAGE_FAILED", error);
+  }
+
+  const published = [];
+  const catalogKeys = [
+    "nativeCatalog",
+    "aliasCatalog",
+    "announcementCatalog",
+    "mergedCatalog",
+  ];
+  try {
+    for (const key of catalogKeys) {
+      fileSystem.renameSync(staged.get(key), paths[key]);
+      staged.delete(key);
+      published.push(key);
+    }
+  } catch (error) {
+    let rollbackError;
+    for (const key of [...published].reverse()) {
+      try {
+        restoreSnapshot(paths[key], snapshots[key], fileSystem, protectFile, suffix);
+      } catch (restoreError) {
+        rollbackError ||= restoreError;
+      }
+    }
+    for (const stagePath of staged.values()) {
+      try {
+        removeIfPresent(stagePath, fileSystem);
+      } catch {
+        // Preserve the primary stable publication failure.
+      }
+    }
+    throw catalogTransactionError(
+      rollbackError ? "CATALOG_ROLLBACK_FAILED" : "CATALOG_PUBLISH_FAILED",
+      rollbackError || error,
+    );
+  }
+
+  let captureMetadataPublished = artifacts.captureMetadata === undefined;
+  if (artifacts.captureMetadata) {
+    const stagePath = staged.get("captureMetadata");
+    try {
+      fileSystem.renameSync(stagePath, paths.captureMetadata);
+      captureMetadataPublished = true;
+    } catch {
+      // The merged generation is already active. Leaving the old metadata is
+      // deliberate: the next refresh will repair instead of returning unchanged.
+      try {
+        removeIfPresent(stagePath, fileSystem);
+      } catch {
+        // The private staged file is harmless and never marks a generation current.
+      }
+    }
+  }
+  return { captureMetadataPublished };
+}
+
+function parsedJsonOrUndefined(target, fileSystem) {
+  try {
+    return JSON.parse(fileSystem.readFileSync(target, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function activeCatalogMatches(artifacts, paths, fileSystem) {
+  const metadata = parsedJsonOrUndefined(paths.captureMetadata, fileSystem);
+  if (
+    metadata?.version !== 1 ||
+    metadata.digest !== artifacts.captureMetadata.digest ||
+    metadata.captured_with !== artifacts.captureMetadata.captured_with
+  ) {
+    return false;
+  }
+  const native = parsedJsonOrUndefined(paths.nativeCatalog, fileSystem);
+  const merged = parsedJsonOrUndefined(paths.mergedCatalog, fileSystem);
+  return (
+    JSON.stringify(native) === JSON.stringify(artifacts.nativeCatalog) &&
+    JSON.stringify(merged) === JSON.stringify(artifacts.mergedCatalog)
+  );
+}
+
+function defaultCatalogContext({ candidate, clientVersion, now, paths }) {
+  const userSlugs = new Set(readUserModels().map((model) => String(model.slug)));
+  const hiddenModels = readHiddenModels();
+  const routedModels = selectedConfiguredListedModels();
+  const multiAgentSettings = readMultiAgentSettings();
+  const visionEngine = resolveVisionEngine(
+    routedModels,
+    readVisionBridgeSettings(),
+  );
+  return {
+    candidate,
+    clientVersion,
+    routedModels,
+    announcedAt: readAnnouncedAt(paths.announcementCatalog),
+    userSlugs,
+    hiddenModels,
+    multiAgentSettings,
+    loginFree: loginFreeConfigured(),
+    openaiAuthenticated: true,
+    now,
+    visionEngine,
+  };
+}
+
+export async function refreshNativeCatalog({
+  stateDir = STATE_DIR,
+  paths = catalogArtifactPaths(stateDir),
+  authPath = path.join(CODEX_HOME, "auth.json"),
+  codexBinary = DEFAULT_CODEX_APP_BINARY,
+  uid,
+  now = Date.now,
+  env,
+  runner,
+  cleanup,
+  acquisitionFileSystem,
+  fileSystem: fileSystemOverrides = {},
+  lockOptions = {},
+  acquire = acquireNativeCatalog,
+  withLock = withCatalogOperationLock,
+  resolveContext = defaultCatalogContext,
+  buildArtifacts = buildCatalogArtifacts,
+  syncAgents = syncRoutedCodexAgents,
+  assertOwnership = assertStateOwnership,
+} = {}) {
+  return withLock(async () => {
+    assertOwnership("refresh the Codex model catalog");
+    const acquired = await acquire({
+      authPath,
+      stateDir,
+      codexBinary,
+      routedSlugs: new Set(MODEL_BY_SLUG.keys()),
+      uid,
+      now,
+      env,
+      runner,
+      fileSystem: acquisitionFileSystem,
+      cleanup,
+    });
+    if (acquired.status === "skipped") {
+      return { status: "skipped", nativeModels: 0 };
+    }
+
+    const clientVersion = acquired.clientVersion;
+    const instant = now();
+    const context = resolveContext({
+      candidate: acquired.candidate,
+      clientVersion,
+      now: instant,
+      paths,
+    });
+    const artifacts = buildArtifacts({
+      ...context,
+      candidate: acquired.candidate,
+      attestation: acquired.attestation,
+      clientVersion,
+      trustedStoredCapturedWith: undefined,
+      now: context.now ?? instant,
+      includeCaptureMetadata: true,
+    });
+    validateCatalogArtifacts(artifacts);
+    syncAgents(artifacts.routedModels);
+    const fileSystem = { ...DEFAULT_CATALOG_FILE_SYSTEM, ...fileSystemOverrides };
+    if (activeCatalogMatches(artifacts, paths, fileSystem)) {
+      return { status: "unchanged", nativeModels: acquired.candidate.models.length };
+    }
+    publishCatalogArtifacts(artifacts, {
+      paths,
+      fileSystem: fileSystemOverrides,
+    });
+    return { status: "updated", nativeModels: acquired.candidate.models.length };
+  }, { stateDir, ...lockOptions });
+}
+
+function main(flags = {}) {
   // The catalog is what Codex offers in its picker. Writing it from a checkout
   // that does not own this state directory is how the picker ends up
   // advertising models the running gateway has no route for.
@@ -477,36 +939,10 @@ function main() {
   const userSlugs = new Set(readUserModels().map((model) => String(model.slug)));
   const hiddenModels = readHiddenModels();
   const selectedModels = selectedConfiguredListedModels();
-  const allMultiAgentModels = applyMultiAgentSettings(
-    selectedModels,
-    readMultiAgentSettings(),
-    hiddenModels,
-  );
-  // Clamp before announcements and agent sync so every surface Codex reads —
-  // picker levels, defaults, and announcement copy — stays inside the effort
-  // vocabulary the installed build can actually deserialize.
-  const { models: routedModels, announcedAt } = annotateNewModelAnnouncements(
-    clampModelEfforts(allMultiAgentModels, codexEffortVocabulary(codexVersion())),
-    readAnnouncedAt(),
-    userSlugs,
-    Date.now(),
-  );
-  // Advertised last, and only while an engine actually resolves: Codex gates
-  // the paste on `input_modalities`, so a bridge that has gone away must take
-  // the advertisement with it rather than leaving a paste that 400s. This runs
-  // after the announcement pass so a bridged model never announces "image
-  // input" as though it grew the capability itself.
+  const multiAgentSettings = readMultiAgentSettings();
+  const currentVersion = codexVersion();
   const visionEngine = resolveVisionEngine(selectedModels, readVisionBridgeSettings());
-  const catalogModels = applyVisionBridge(routedModels, visionEngine);
-  const captured = nativeCatalog();
-  const native = {
-    ...captured,
-    models: promoteNativeMultiAgent(
-      captured.models,
-      readMultiAgentSettings(),
-      hiddenModels,
-    ),
-  };
+  const captured = nativeCatalog(flags);
   // Dropping every native model is destructive, so only do it when Codex
   // actually answered that the session is signed out. If the probe could not
   // run at all we do not know, and guessing "signed out" is what silently
@@ -521,38 +957,37 @@ function main() {
   }
   const openaiAuthenticated = auth.authenticated;
   const loginFree = loginFreeConfigured();
-  const { models: merged, aliases } = loginFree
-    ? buildLoginFreeCatalog(native, catalogModels)
-    : {
-        models: buildMergedCatalog(native, catalogModels, {
-          includeNative: openaiAuthenticated,
-        }),
-        aliases: {},
-      };
-  atomicJson(MERGED_CATALOG_PATH, {
-    models: merged.map((model) =>
-      hiddenModels.has(String(model.slug))
-        ? { ...model, visibility: "hide" }
-        : model,
-    ),
+  const paths = catalogArtifactPaths();
+  const artifacts = buildCatalogArtifacts({
+    candidate: captured.candidate,
+    trustedStoredCapturedWith: captured.trustedStoredCapturedWith,
+    clientVersion: currentVersion,
+    routedModels: selectedModels,
+    announcedAt: readAnnouncedAt(paths.announcementCatalog),
+    userSlugs,
+    hiddenModels,
+    multiAgentSettings,
+    loginFree,
+    openaiAuthenticated,
+    now: Date.now(),
+    visionEngine,
+    includeCaptureMetadata: false,
   });
-  atomicJson(NATIVE_ALIAS_PATH, { version: 1, aliases });
-  writeAnnouncedAt(announcedAt);
-  const routedAgents = syncRoutedCodexAgents(routedModels);
+  validateCatalogArtifacts(artifacts);
+  // Agent synchronization and every validation/staging step finish before the
+  // first live catalog target changes. The merged catalog then publishes last.
+  const routedAgents = syncRoutedCodexAgents(artifacts.routedModels);
+  publishCatalogArtifacts(artifacts, { paths });
   process.stdout.write(
     `${JSON.stringify({
-      path: MERGED_CATALOG_PATH,
-      models: merged.length,
-      routed_models: routedModels.length,
+      path: paths.mergedCatalog,
+      models: artifacts.summary.models,
+      routed_models: artifacts.summary.routedModels,
       routed_agents: routedAgents.length,
-      vision_bridge_engine: visionEngine?.slug || null,
-      vision_bridged_models: catalogModels.filter(
-        (model) => model.visionBridgeEngine !== undefined,
-      ).length,
-      native_models: !loginFree && openaiAuthenticated
-        ? merged.filter((model) => !MODEL_BY_SLUG.has(String(model.slug))).length
-        : 0,
-      aliased_models: Object.keys(aliases).length,
+      vision_bridge_engine: artifacts.summary.visionBridgeEngine,
+      vision_bridged_models: artifacts.summary.visionBridgedModels,
+      native_models: artifacts.summary.nativeModels,
+      aliased_models: artifacts.summary.aliasedModels,
       login_free: loginFree,
       openai_authenticated: openaiAuthenticated,
       openai_auth_reason: auth.reason,
@@ -561,9 +996,22 @@ function main() {
   );
 }
 
+export async function runCatalogCli({
+  argv = process.argv.slice(2),
+  withLock = withCatalogOperationLock,
+  operation = main,
+  stateDir,
+} = {}) {
+  const flags = {
+    refreshNative: argv.includes("--refresh-native"),
+    bundledNative: argv.includes("--bundled-native"),
+  };
+  return withLock(() => operation(flags), stateDir ? { stateDir } : undefined);
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    main();
+    await runCatalogCli();
   } catch (error) {
     // Ownership conflicts are an operator mistake with a specific remedy, so
     // print the guidance rather than a stack trace.

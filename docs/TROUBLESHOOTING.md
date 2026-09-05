@@ -50,6 +50,45 @@ To deliberately switch ownership to the checkout you are running from:
 MODEL_ROUTER_ALLOW_FOREIGN_STATE=1 ./bin/model-router codex doctor --fix
 ```
 
+## A newly released native OpenAI model is missing
+
+Leave the tray running and fully quit every Codex desktop app instance. Closing
+only a window is not enough. The refresh starts only when the observed Codex
+instance count changes from one or more to zero; the tray's initial observation
+of no running Codex app and an intermediate exit such as `2` to `1` do not
+trigger it. The separate ChatGPT desktop app may remain open.
+
+Codex does not wait for the refresh or reload its catalog while running. If you
+reopen it before publication finishes, that process continues with the old
+catalog. After the tray reports **Model catalog refreshed. Quit and reopen
+Codex once more.**, fully quit and reopen Codex again. If the refresh finished
+before you reopened Codex, the tray instead reports **Model catalog refreshed
+for the next Codex launch.** An unchanged account catalog reports **Model
+catalog is already current.**
+
+For a manual retry on macOS, keep Codex fully quit and run:
+
+```sh
+./bin/refresh-catalog
+```
+
+The command uses the same isolated, transactional path as the tray and does not
+disable or restore the live router configuration. Only one refresh runs at a
+time; repeated quit notifications add no work, and any complete launch/quit
+cycles observed while one is running coalesce into at most one follow-up.
+
+No tray message after a quit can mean the canonical protected ChatGPT file
+credential is absent, which is an intentional quiet skip. Confirm that Codex is
+signed in normally, then retry. For unsafe credential metadata, network or
+account acquisition failures, and catalog validation failures, the tray reports
+only **Catalog refresh failed; the previous catalog remains active.** The
+previous complete catalog remains usable in those cases.
+
+Do not use an upstream update as a substitute for this check. Updating can
+change the router source, but it does not by itself perform the authenticated
+account-catalog refresh. Use the final-instance quit trigger or the manual
+command, then launch Codex after publication to load the result.
+
 ## External models are missing from the picker
 
 ```sh

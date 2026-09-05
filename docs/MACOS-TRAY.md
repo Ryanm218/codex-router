@@ -52,6 +52,51 @@ shows up exactly while Codex is open. While hidden, reopen Codex (or run
 always` and relaunch) to reach the toggle again. The router's background
 service is unaffected by visibility.
 
+## Refresh the native OpenAI model catalog after quitting Codex
+
+The tray refreshes the authenticated native OpenAI model catalog when the
+number of running Codex desktop app instances (`com.openai.codex`) changes from
+one or more to zero. Starting the tray while Codex is already absent only seeds
+the count and does not refresh. Likewise, one instance exiting while another
+remains open — for example, a `2` to `1` transition — does not refresh. The
+final Codex instance exiting does, even if the separate ChatGPT desktop app is
+still open. A Codex restart initiated by the tray for a managed mode change is
+suppressed so it does not cause an incidental refresh.
+
+Only one catalog refresh runs at a time. Repeated zero-count notifications do
+not add work. If one or more complete Codex launch/final-exit cycles occur while
+a refresh is in flight, they coalesce into at most one follow-up refresh after
+the current one finishes.
+
+Codex loads `model_catalog_json` at process startup; the tray does not pause a
+quick relaunch or reload a process that is already running. The first Codex
+process launched after a successful publication uses the refreshed catalog. If
+Codex relaunches before publication finishes, that process keeps the previous
+catalog and the tray reports **Model catalog refreshed. Quit and reopen Codex
+once more.** A refresh that finishes before the relaunch reports **Model
+catalog refreshed for the next Codex launch.** An already-current result
+reports **Model catalog is already current.**
+
+When the canonical protected ChatGPT file credential is absent, the automatic
+refresh quietly skips without showing an error after every quit. Unsafe
+credential metadata, acquisition failures, and validation failures show only
+the fixed message **Catalog refresh failed; the previous catalog remains
+active.** They do not replace the last-known-good merged catalog or modify the
+live router configuration.
+
+To request the same safe refresh manually on macOS, fully quit Codex and run:
+
+```sh
+./bin/refresh-catalog
+```
+
+This command uses the same isolated acquisition and transactional publication
+path as the tray. It does not temporarily disable or restore the live Codex
+router configuration. Syncing or updating the source checkout is a separate
+operation: an upstream update alone is not the authenticated account-catalog
+freshness mechanism. The final-instance quit trigger, or the manual command
+above, performs that refresh.
+
 ## Provider usage
 
 The tray's **All usage** grid shows only connected accounts: ChatGPT when native

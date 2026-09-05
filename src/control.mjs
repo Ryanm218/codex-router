@@ -455,6 +455,34 @@ async function updateAndVerifyCodex() {
   process.stdout.write(`${JSON.stringify(runCodexMaintenance())}\n`);
 }
 
+async function refreshCatalog() {
+  try {
+    const { refreshNativeCatalog } = await import("./catalog.mjs");
+    const result = await refreshNativeCatalog();
+    if (
+      !["updated", "unchanged", "skipped"].includes(result?.status) ||
+      !Number.isInteger(result?.nativeModels) ||
+      result.nativeModels < 0
+    ) {
+      const error = new Error("Invalid catalog refresh result.");
+      error.code = "CATALOG_REFRESH_RESULT_INVALID";
+      throw error;
+    }
+    process.stdout.write(
+      `${JSON.stringify({ status: result.status, nativeModels: result.nativeModels })}\n`,
+    );
+  } catch (error) {
+    const reason =
+      typeof error?.code === "string" && /^[A-Za-z][A-Za-z0-9_]*$/.test(error.code)
+        ? error.code
+        : "CATALOG_REFRESH_FAILED";
+    process.stderr.write(
+      `Catalog refresh failed; the previous catalog remains active. Reason: ${reason}.\n`,
+    );
+    process.exitCode = 1;
+  }
+}
+
 function runDoctor(args) {
   const result = spawnSync(
     process.execPath,
@@ -1097,6 +1125,8 @@ if (args.includes("--probe")) {
   await handlePresence(args[1], args[2]);
 } else if (args[0] === "maintenance") {
   await updateAndVerifyCodex();
+} else if (args[0] === "catalog-refresh") {
+  await refreshCatalog();
 } else if (args[0] === "doctor") {
   runDoctor(args.slice(1));
 } else {

@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -9,6 +18,28 @@ import { fileURLToPath } from "node:url";
 import { pickerCommandArgs } from "../src/control-args.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function isolatedCatalogRefreshControl(t, catalogModule) {
+  const fixtureRoot = mkdtempSync(path.join(os.tmpdir(), "control-catalog-refresh-"));
+  t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+  mkdirSync(path.join(fixtureRoot, "bin"));
+  mkdirSync(path.join(fixtureRoot, "src"));
+  copyFileSync(path.join(root, "bin", "control"), path.join(fixtureRoot, "bin", "control"));
+  chmodSync(path.join(fixtureRoot, "bin", "control"), 0o755);
+  copyFileSync(
+    path.join(root, "src", "control.mjs"),
+    path.join(fixtureRoot, "src", "control.mjs"),
+  );
+  copyFileSync(
+    path.join(root, "src", "control-args.mjs"),
+    path.join(fixtureRoot, "src", "control-args.mjs"),
+  );
+  writeFileSync(path.join(fixtureRoot, "src", "catalog.mjs"), catalogModule);
+  return spawnSync(path.join(fixtureRoot, "bin", "control"), ["catalog-refresh"], {
+    cwd: fixtureRoot,
+    encoding: "utf8",
+  });
+}
 
 function probe(target, providers, usageEvents = [], options = {}) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "control-probe-"));
@@ -487,6 +518,66 @@ test("aggregate overview covers every target", () => {
   });
   const overview = JSON.parse(output);
   assert.deepEqual(Object.keys(overview.targets).sort(), ["codex"]);
+});
+
+for (const [status, nativeModels] of [
+  ["updated", 9],
+  ["unchanged", 8],
+  ["skipped", 0],
+]) {
+  test(`catalog-refresh emits only the narrow ${status} result`, (t) => {
+    const result = isolatedCatalogRefreshControl(
+      t,
+      `export async function refreshNativeCatalog() {
+        return ${JSON.stringify({ status, nativeModels, privateDetail: "must-not-escape" })};
+      }\n`,
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, `${JSON.stringify({ status, nativeModels })}\n`);
+    assert.equal(result.stderr, "");
+  });
+}
+
+test("catalog-refresh failure exposes fixed operator text and a stable code only", (t) => {
+  const result = isolatedCatalogRefreshControl(
+    t,
+    `export async function refreshNativeCatalog() {
+      const error = new Error("RAW_ERROR_MESSAGE_SENTINEL");
+      error.code = "CHILD_FAILED";
+      error.stdout = "RAW_FIXTURE_STDOUT_SENTINEL";
+      error.stderr = "RAW_FIXTURE_STDERR_SENTINEL";
+      throw error;
+    }\n`,
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, "");
+  assert.equal(
+    result.stderr,
+    "Catalog refresh failed; the previous catalog remains active. Reason: CHILD_FAILED.\n",
+  );
+  assert.doesNotMatch(
+    `${result.stdout}${result.stderr}`,
+    /RAW_ERROR_MESSAGE_SENTINEL|RAW_FIXTURE_STDOUT_SENTINEL|RAW_FIXTURE_STDERR_SENTINEL|Error:|at file:/,
+  );
+});
+
+test("catalog-refresh rejects a negative native-model count with fixed safe output", (t) => {
+  const result = isolatedCatalogRefreshControl(
+    t,
+    `export async function refreshNativeCatalog() {
+      return { status: "updated", nativeModels: -1, privateDetail: "RAW_RESULT_SENTINEL" };
+    }\n`,
+  );
+
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, "");
+  assert.equal(
+    result.stderr,
+    "Catalog refresh failed; the previous catalog remains active. Reason: CATALOG_REFRESH_RESULT_INVALID.\n",
+  );
+  assert.doesNotMatch(`${result.stdout}${result.stderr}`, /RAW_RESULT_SENTINEL|Error:|at file:/);
 });
 
 // --- quota fallback: status, control commands, doctor visibility ----------

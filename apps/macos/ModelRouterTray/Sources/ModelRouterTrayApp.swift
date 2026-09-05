@@ -93,6 +93,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// default (nil) override, which runs `bin/control` as a real subprocess;
 /// only tests construct a `RouterStore` with a scripted runner.
 typealias RouterControlRunner = @Sendable ([String], Data?) async throws -> Data
+typealias RouterCodexRestartRunner = @MainActor (
+  (Int) -> Void,
+  () -> Void
+) async throws -> Void
 
 @MainActor
 final class RouterStore: ObservableObject {
@@ -142,6 +146,14 @@ final class RouterStore: ObservableObject {
   private var serviceWork: Task<Void, Never>?
   private var serviceIntent: ServiceIntent = .unknown
   private let controlRunnerOverride: RouterControlRunner?
+  private let codexRestartRunnerOverride: RouterCodexRestartRunner?
+  private var providerOperationWaiters: [CheckedContinuation<Void, Never>] = []
+  private var observedCodexInstanceCount = 0
+  private var managedRestartSuppressionArmed = false
+  private lazy var codexCatalogRefreshCoordinator = CodexCatalogRefreshCoordinator {
+    [weak self] in
+    await self?.runCatalogRefreshWhenAvailable()
+  }
   // Codex relaunches itself to apply updates, so a momentary disappearance must
   // not bounce the router. Wait the absence out and re-check before stopping.
   private let hostAppAbsenceGrace = Duration.seconds(30)
@@ -199,8 +211,12 @@ final class RouterStore: ObservableObject {
   /// `controlRunnerOverride` is nil in every production path; `RouterStore()`
   /// via `RouterStore.shared` is unaffected. Only tests pass a scripted
   /// runner, via `RouterStore(controlRunnerOverride:)`.
-  init(controlRunnerOverride: RouterControlRunner? = nil) {
+  init(
+    controlRunnerOverride: RouterControlRunner? = nil,
+    codexRestartRunnerOverride: RouterCodexRestartRunner? = nil
+  ) {
     self.controlRunnerOverride = controlRunnerOverride
+    self.codexRestartRunnerOverride = codexRestartRunnerOverride
     selectedUsageProviderID = "openai"
     if let raw = defaults.string(forKey: islandModeKey), let mode = IslandMode(rawValue: raw) {
       islandMode = mode
@@ -287,12 +303,67 @@ final class RouterStore: ObservableObject {
   }
 
   private func refreshHostAppRunning() {
-    hostAppRunning = hostAppBundleIDs.contains { identifier in
-      NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
-        .contains { !$0.isTerminated }
-    }
+    let runningCounts = Dictionary(uniqueKeysWithValues: hostAppBundleIDs.map { identifier in
+      let count = NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+        .filter { !$0.isTerminated }
+        .count
+      return (identifier, count)
+    })
+    observeHostApplications(
+      codexInstanceCount: runningCounts["com.openai.codex"] ?? 0,
+      chatGPTInstanceCount: runningCounts["com.openai.chat"] ?? 0
+    )
+  }
+
+  /// Deterministic lifecycle seam shared by workspace notifications and tests.
+  /// Catalog transitions consume only the Codex count; the aggregate state
+  /// remains the existing Codex-or-ChatGPT contract for surfaces and service.
+  func observeHostApplications(codexInstanceCount: Int, chatGPTInstanceCount: Int) {
+    observedCodexInstanceCount = codexInstanceCount
+    hostAppRunning = codexInstanceCount > 0 || chatGPTInstanceCount > 0
+    _ = codexCatalogRefreshCoordinator.observeCodexInstanceCount(codexInstanceCount)
     refreshSurfacesVisible()
     reconcileService()
+  }
+
+  private func runCatalogRefreshWhenAvailable() async {
+    await reserveCatalogRefreshOperation()
+    defer { finishProviderOperation() }
+    guard observedCodexInstanceCount == 0 else { return }
+
+    do {
+      let output = try await runControl(arguments: ["catalog-refresh"])
+      let result = try JSONDecoder().decode(CatalogRefreshControlResult.self, from: output)
+      guard result.nativeModels >= 0 else { throw CatalogRefreshResultError.invalid }
+      switch result.status {
+      case .updated:
+        message = observedCodexInstanceCount > 0
+          ? "Model catalog refreshed. Quit and reopen Codex once more."
+          : "Model catalog refreshed for the next Codex launch."
+      case .unchanged:
+        message = "Model catalog is already current."
+      case .skipped:
+        break
+      }
+    } catch {
+      message = "Catalog refresh failed; the previous catalog remains active."
+    }
+  }
+
+  private func reserveCatalogRefreshOperation() async {
+    while providerOperation != nil {
+      await withCheckedContinuation { continuation in
+        providerOperationWaiters.append(continuation)
+      }
+    }
+    providerOperation = "catalog-refresh"
+  }
+
+  private func finishProviderOperation() {
+    providerOperation = nil
+    let waiters = providerOperationWaiters
+    providerOperationWaiters.removeAll()
+    waiters.forEach { $0.resume() }
   }
 
   private func refreshSurfacesVisible() {
@@ -977,7 +1048,7 @@ final class RouterStore: ObservableObject {
   func setProvider(_ provider: String, enabled: Bool) async {
     guard providerOperation == nil else { return }
     providerOperation = provider
-    defer { providerOperation = nil }
+    defer { finishProviderOperation() }
     do {
       try await updateProviderSelection(provider, enabled: enabled)
       await refresh()
@@ -996,7 +1067,7 @@ final class RouterStore: ObservableObject {
     providerOperation = "maintenance"
     maintenanceMessage = "Running update and doctor…"
     maintenanceSucceeded = false
-    defer { providerOperation = nil }
+    defer { finishProviderOperation() }
     do {
       _ = try await runControl(arguments: ["maintenance"])
       await refresh()
@@ -1016,7 +1087,7 @@ final class RouterStore: ObservableObject {
     providerOperation = "doctor"
     maintenanceMessage = "Running doctor --fix…"
     maintenanceSucceeded = false
-    defer { providerOperation = nil }
+    defer { finishProviderOperation() }
     do {
       _ = try await runControl(arguments: ["doctor", "--fix"])
       await refresh()
@@ -1034,7 +1105,7 @@ final class RouterStore: ObservableObject {
   func setLoginFree(_ enabled: Bool) async {
     guard providerOperation == nil else { return }
     providerOperation = "auth-mode"
-    defer { providerOperation = nil }
+    defer { finishProviderOperation() }
     do {
       _ = try await runControl(arguments: ["auth-mode", enabled ? "on" : "off"])
     } catch {
@@ -1171,7 +1242,7 @@ final class RouterStore: ObservableObject {
   private func applyModelSettings(arguments: [String]) async {
     guard providerOperation == nil else { return }
     providerOperation = "models"
-    defer { providerOperation = nil }
+    defer { finishProviderOperation() }
     do {
       _ = try await runControl(arguments: arguments)
       await refresh()
@@ -1188,7 +1259,7 @@ final class RouterStore: ObservableObject {
     guard providerOperation == nil else { return }
     let previous = quotaFallback
     providerOperation = "quota-fallback"
-    defer { providerOperation = nil }
+    defer { finishProviderOperation() }
     do {
       _ = try await runControl(arguments: enabled
         ? ["quota-fallback", "set", "kimi-api/kimi-k3"]
@@ -1215,7 +1286,7 @@ final class RouterStore: ObservableObject {
   ) async {
     guard providerOperation == nil else { return }
     providerOperation = provider
-    defer { providerOperation = nil }
+    defer { finishProviderOperation() }
     do {
       try await operation()
       await refreshProviderSetup()
@@ -1367,11 +1438,28 @@ final class RouterStore: ObservableObject {
   }
 
   private func restartCodexApp() async throws {
+    do {
+      if let codexRestartRunnerOverride {
+        try await codexRestartRunnerOverride(
+          { [weak self] count in self?.managedRestartWillTerminate(count) },
+          { [weak self] in self?.managedRestartDidTerminate() }
+        )
+        clearUnconsumedManagedRestartSuppression()
+        return
+      }
+      try await restartCodexAppUsingWorkspace()
+    } catch {
+      clearUnconsumedManagedRestartSuppression()
+      throw error
+    }
+  }
+
+  private func restartCodexAppUsingWorkspace() async throws {
     let bundleIdentifier = "com.openai.codex"
     let workspace = NSWorkspace.shared
     let runningApplications = NSRunningApplication.runningApplications(
       withBundleIdentifier: bundleIdentifier
-    )
+    ).filter { !$0.isTerminated }
     let applicationURL = runningApplications.compactMap(\.bundleURL).first
       ?? workspace.urlForApplication(withBundleIdentifier: bundleIdentifier)
 
@@ -1379,7 +1467,8 @@ final class RouterStore: ObservableObject {
       throw RouterError("the Codex desktop app could not be found")
     }
 
-    for application in runningApplications where !application.isTerminated {
+    managedRestartWillTerminate(runningApplications.count)
+    for application in runningApplications {
       guard application.terminate() else {
         throw RouterError("Codex did not accept a graceful quit request")
       }
@@ -1394,6 +1483,10 @@ final class RouterStore: ObservableObject {
       throw RouterError("Codex did not quit in time; restart it manually")
     }
 
+    // Consume suppression deterministically before opening the replacement.
+    // Workspace notifications can be reordered, but this observation cannot.
+    managedRestartDidTerminate()
+
     let configuration = NSWorkspace.OpenConfiguration()
     configuration.activates = true
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -1405,6 +1498,23 @@ final class RouterStore: ObservableObject {
         }
       }
     }
+  }
+
+  private func managedRestartWillTerminate(_ runningInstanceCount: Int) {
+    guard runningInstanceCount > 0 else { return }
+    managedRestartSuppressionArmed = true
+    codexCatalogRefreshCoordinator.armManagedRestartSuppression()
+  }
+
+  private func managedRestartDidTerminate() {
+    guard managedRestartSuppressionArmed else { return }
+    managedRestartSuppressionArmed = false
+    _ = codexCatalogRefreshCoordinator.observeCodexInstanceCount(0)
+  }
+
+  private func clearUnconsumedManagedRestartSuppression() {
+    managedRestartSuppressionArmed = false
+    codexCatalogRefreshCoordinator.managedRestartTerminationFailed()
   }
 
   private func runControl(arguments: [String], stdin: Data? = nil) async throws -> Data {
@@ -1505,6 +1615,21 @@ private struct RouterError: LocalizedError {
   let message: String
   init(_ message: String) { self.message = message }
   var errorDescription: String? { message }
+}
+
+private struct CatalogRefreshControlResult: Decodable {
+  enum Status: String, Decodable {
+    case updated
+    case unchanged
+    case skipped
+  }
+
+  let status: Status
+  let nativeModels: Int
+}
+
+private enum CatalogRefreshResultError: Error {
+  case invalid
 }
 
 struct RouterSnapshot: Decodable {
