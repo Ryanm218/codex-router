@@ -42,6 +42,44 @@ const {
   clearChatGPTLoginLease,
   createChatGPTLoginLease,
 } = await import(loginLeaseUrl);
+const accountOperationLockUrl = import.meta.url.includes("/app.asar/")
+  ? new URL("../../src/chatgpt-account-operation-lock.mjs", import.meta.url)
+  : new URL("../../../src/chatgpt-account-operation-lock.mjs", import.meta.url);
+const { withChatGPTAccountOperationLock } = await import(accountOperationLockUrl);
+const requestUseLeaseUrl = import.meta.url.includes("/app.asar/")
+  ? new URL("../../src/chatgpt-request-use-lease.mjs", import.meta.url)
+  : new URL("../../../src/chatgpt-request-use-lease.mjs", import.meta.url);
+const {
+  assertNoActiveRequestUseLeases,
+  assertNoChatGPTProfileSwitchReservation,
+} = await import(requestUseLeaseUrl);
+
+export async function reserveChatGPTInteractiveLogin(accountId, options = {}) {
+  const id = String(accountId || "").trim();
+  if (!CHATGPT_ACCOUNT_ID.test(id)) throw new Error("Account id is invalid.");
+  const homesDir = options.homesDir || (options.accountHome ? path.dirname(options.accountHome) : undefined);
+  const accountHome = options.accountHome || (homesDir ? path.join(homesDir, id) : undefined);
+  return withChatGPTAccountOperationLock(id, () => {
+    assertNoChatGPTProfileSwitchReservation({ switchPath: options.switchPath });
+    assertNoActiveRequestUseLeases(id, {
+      ...(accountHome ? { accountHome } : {}),
+      ...(homesDir ? { homesDir } : {}),
+      ...(options.requestLeaseIdentityProbe ? { identityProbe: options.requestLeaseIdentityProbe } : {}),
+      ...(options.now === undefined ? {} : { now: options.now }),
+    });
+    const createLease = options.createLoginLease || createChatGPTLoginLease;
+    return createLease(id, options.pid || process.pid, {
+      ...(accountHome ? { accountHome } : {}),
+      ...(homesDir ? { homesDir } : {}),
+      phase: "reserved",
+    });
+  }, {
+    ...(accountHome ? { accountHome } : {}),
+    ...(homesDir ? { homesDir } : {}),
+    ...(options.waitMs === undefined ? {} : { waitMs: options.waitMs }),
+    ...(options.retryMs === undefined ? {} : { retryMs: options.retryMs }),
+  });
+}
 
 // Codex is the one client-specific adapter this panel still exposes (native
 // GPT details and the current task default). Routed model identity and picker
@@ -1950,10 +1988,10 @@ export function registerIpcHandlers({
     try {
       // Reserve ownership before spawning. A desktop crash can therefore
       // never leave a credential writer with no durable pre-auth evidence.
-      loginLease = createChatGPTLoginLease(id, process.pid, {
+      loginLease = await reserveChatGPTInteractiveLogin(id, {
         accountHome: profileHome,
         homesDir: path.dirname(profileHome),
-        phase: "reserved",
+        createLoginLease: createChatGPTLoginLease,
       });
       const processLoginExit = async (outcome = {}) => {
         const current = subscriptionLoginAttempts.get(id);
@@ -2041,7 +2079,14 @@ export function registerIpcHandlers({
               accountHome: profileHome,
               homesDir: path.dirname(profileHome),
             })
-          ) clearChatGPTLoginLease(id, loginLease, {
+          ) await withChatGPTAccountOperationLock(id, () => clearChatGPTLoginLease(
+            id,
+            loginLease,
+            {
+              accountHome: profileHome,
+              homesDir: path.dirname(profileHome),
+            },
+          ), {
             accountHome: profileHome,
             homesDir: path.dirname(profileHome),
           });

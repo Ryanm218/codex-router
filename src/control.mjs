@@ -3446,6 +3446,7 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
     chatGPTSubscriptionAccountPoolSnapshot,
     createChatGPTSubscriptionAccount,
     readChatGPTAccountPoolState,
+    writeChatGPTAccountPoolState,
     refreshBoundedChatGPTSubscriptionAccounts,
     withChatGPTAccountPoolLock,
   } = await import("./chatgpt-account-pool.mjs");
@@ -3465,11 +3466,23 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
     // This is the single production reconcile poll, owned by the Control
     // Center account view. It is read-only for settled state; after Codex has
     // closed it completes an explicit pending handoff or durable crash phase.
-    const recovery = await recoverCompletedChatGPTProfileLogins();
-    await reconcileChatGPTProfileSwitchIfReady();
-    await ensureChatGPTProfileAccounts();
-    const beforeRefresh = chatGPTSubscriptionAccountPoolSnapshot();
-    await refreshBoundedChatGPTSubscriptionAccounts(beforeRefresh);
+    let recovery = { recovered: [], failures: [] };
+    let maintenanceDeferred = false;
+    try {
+      recovery = await recoverCompletedChatGPTProfileLogins();
+      await reconcileChatGPTProfileSwitchIfReady();
+      await ensureChatGPTProfileAccounts();
+    } catch (error) {
+      if (error?.code !== "chatgpt_account_request_in_use") throw error;
+      // A status poll must remain observable while a backup request owns its
+      // account. Defer all auth/profile writers until the request lease clears
+      // instead of turning an ordinary in-flight hop into a broken UI poll.
+      maintenanceDeferred = true;
+    }
+    if (!maintenanceDeferred) {
+      const beforeRefresh = chatGPTSubscriptionAccountPoolSnapshot();
+      await refreshBoundedChatGPTSubscriptionAccounts(beforeRefresh);
+    }
     const safe = chatGPTSubscriptionAccountPoolSnapshot();
     const profile = chatGPTProfileSwitchSnapshot();
     const loginAttempts = {};
@@ -3515,6 +3528,7 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
       ...(Object.keys(loginAttempts).length ? { loginAttempts } : {}),
       profile,
       sessions: { count: Object.keys(safe.sessions || {}).length },
+      ...(maintenanceDeferred ? { maintenance: { deferred: "request-in-use" } } : {}),
     })}\n`);
     return;
   }
@@ -3567,6 +3581,28 @@ async function handleChatGptAccountSwitch(action, value, completionLease) {
       process.stdout.write(`${JSON.stringify(chatGPTProfileSwitchSnapshot())}\n`);
       return;
     }
+  }
+  if (action === "fallback") {
+    if (!value || value === "status") {
+      const state = readChatGPTAccountPoolState();
+      process.stdout.write(`${JSON.stringify({ enabled: state.policy.fallback.enabled, strategy: state.policy.fallback.strategy, maxHops: state.policy.fallback.maxHops })}\n`);
+      return;
+    }
+    if (value !== "on" && value !== "off") throw new Error("Usage: control chatgpt-account-pool fallback <on|off|status>");
+    if (process.platform !== "darwin" && process.platform !== "linux" && process.platform !== "freebsd") {
+      throw new Error("OpenAI account fallback is unsupported on this platform; use explicit account switching.");
+    }
+    const profile = chatGPTProfileSwitchSnapshot();
+    const state = await withChatGPTAccountPoolLock(() => {
+      const current = readChatGPTAccountPoolState();
+      if (value === "on" && (!profile.active || profile.active !== current.policy.selectedAccountId || profile.pending)) {
+        throw new Error("The selected ChatGPT account must be active before fallback can be enabled.");
+      }
+      current.policy.fallback = { ...current.policy.fallback, enabled: value === "on" };
+      return writeChatGPTAccountPoolState(current);
+    });
+    process.stdout.write(JSON.stringify({ enabled: state.policy.fallback.enabled }) + "\n");
+    return;
   }
   throw new Error("Usage: control chatgpt-account-pool status|add [label]|home <acct_id>|login-finalize <acct_id> <lease>|remove <acct_id>|select <acct_id>|profile status|profile reconcile");
 }
@@ -3622,6 +3658,19 @@ if (args.includes("--probe")) {
     throw new Error("Usage: control catalog-cache invalidate <provider>");
   }
   await invalidateProviderCatalog(args[2]);
+} else if (args[0] === "catalog-refresh") {
+  if (args.length > 1) {
+    throw new Error("Usage: control catalog-refresh");
+  }
+  const refresh = spawnSync(
+    process.execPath,
+    [path.join(REPO_ROOT, "src", "refresh-catalog.mjs")],
+    { cwd: REPO_ROOT, env: process.env, encoding: "utf8" },
+  );
+  if (refresh.status !== 0) {
+    throw new Error("Codex model catalog refresh failed.");
+  }
+  process.stdout.write(`${JSON.stringify({ status: "updated" })}\n`);
 } else if (args[0] === "credential") {
   if (!args[1]) throw new Error("Usage: control credential <provider> [--remove]");
   if (args.includes("--remove")) {

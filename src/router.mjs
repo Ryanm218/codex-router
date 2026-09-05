@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import http from "node:http";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   brotliDecompressSync,
   gunzipSync,
@@ -251,6 +251,14 @@ import {
   nativeSessionHeaders,
   nativeSessionTokenMatches,
 } from "./codex-native-session.mjs";
+import {
+  chatGPTSubscriptionAccountHome,
+  chatGPTSubscriptionAccountStatus,
+  eligibleChatGPTFallbackAccounts,
+  readChatGPTAccountPoolState,
+} from "./chatgpt-account-pool.mjs";
+import { snapshotChatGPTRequestAuth } from "./chatgpt-account-auth.mjs";
+import { createRequestUseLease } from "./chatgpt-request-use-lease.mjs";
 import {
   installStableFetchTransport,
   longIdleStreamFetch,
@@ -3981,6 +3989,136 @@ async function attemptModelFailover({
   return undefined;
 }
 
+function nativeTerminalQuotaFailure({ status, bodyText } = {}) {
+  if (status !== 429 || typeof bodyText !== "string") return false;
+  try {
+    const parsed = JSON.parse(bodyText);
+    const error = parsed?.error && typeof parsed.error === "object" ? parsed.error : parsed;
+    return error?.type === "usage_limit" || error?.type === "usage_limit_reached"
+      || error?.code === "usage_limit" || error?.code === "usage_limit_reached";
+  } catch {
+    return false;
+  }
+}
+
+function nativeBodyIsPortable(body) {
+  try {
+    const value = JSON.parse(Buffer.isBuffer(body) ? body.toString("utf8") : String(body || ""));
+    const forbidden = new Set([
+      "previous_response_id",
+      "conversation_id",
+      "encrypted_content",
+      "file_id",
+      "file_ids",
+      "compaction",
+      "compaction_id",
+    ]);
+    const visit = (node) => {
+      if (!node || typeof node !== "object") return true;
+      if (Array.isArray(node)) return node.every(visit);
+      return Object.entries(node).every(([key, child]) => !forbidden.has(key) && visit(child));
+    };
+    return visit(value);
+  } catch {
+    return false;
+  }
+}
+
+// Native OpenAI account fallback is deliberately narrower than model
+// failover: it is opt-in, POSIX-only, and only a terminal quota response may
+// move an otherwise uncommitted Responses turn to an enrolled account.
+export async function attemptNativeAccountFailover({
+  request,
+  response,
+  target,
+  headers,
+  body,
+  portableBody = body,
+  primaryAccountId,
+  primaryFailure,
+  signal,
+  platform = process.platform,
+  readPool = readChatGPTAccountPoolState,
+  authSnapshot = snapshotChatGPTRequestAuth,
+  fetchImpl = fetch,
+  sessionMatches = nativeSessionTokenMatches,
+  subscriptionStatus = (accountId) => chatGPTSubscriptionAccountStatus(accountId),
+  createLease = createRequestUseLease,
+}) {
+  if (platform !== "darwin" && platform !== "linux" && platform !== "freebsd") return undefined;
+  if (signal.aborted || !nothingRelayed(response)) return undefined;
+  // A substituted Cursor/Claude/Gemini caller is authorized by the router's
+  // shared local session, not by the Codex process that owns this transcript.
+  // Cross-account replay is therefore never safe for that surface.
+  if (callerBroughtNoUpstreamCredential(request)) return undefined;
+  if (!sessionMatches(bearerToken(headers.authorization))) return undefined;
+  if (!primaryAccountId) return undefined;
+  if (!nativeTerminalQuotaFailure(primaryFailure)) return undefined;
+  // `body` is the immutable wire representation and may already be zstd
+  // compressed. Portability is a semantic JSON decision, so inspect the
+  // normalized pre-compression bytes while replaying the original wire bytes.
+  if (!nativeBodyIsPortable(portableBody)) return undefined;
+  let pool;
+  try { pool = readPool(); } catch { return undefined; }
+  const candidates = eligibleChatGPTFallbackAccounts({
+    pool,
+    primaryAccountId,
+    subscriptionStatus,
+  });
+  const accountBoundHeaders = new Set([
+    "x-codex-turn-state",
+    "x-oai-attestation",
+  ]);
+  // These headers encode state purchased under the primary account. A
+  // cross-account replay is unsafe; preserve the primary response whenever
+  // any of them is present instead of attempting to sanitize opaque state.
+  if (Object.keys(headers).some((name) => accountBoundHeaders.has(name.toLowerCase()))) {
+    return undefined;
+  }
+  for (const account of candidates) {
+    if (signal.aborted || !nothingRelayed(response)) return undefined;
+    let lease;
+    try {
+      lease = await createLease({
+        accountId: account.id,
+        affinityGeneration: randomBytes(16).toString("base64url"),
+        requestStartedWallMs: Date.now(),
+      });
+    } catch {
+      continue;
+    }
+    let auth;
+    try {
+      auth = await authSnapshot({
+        codexHome: chatGPTSubscriptionAccountHome(account.id),
+        expectedAccountId: account.identity.accountId,
+      });
+    } catch {
+      await lease.release().catch(() => {});
+      continue;
+    }
+    const candidateHeaders = { ...headers };
+    Object.assign(candidateHeaders, auth.headers);
+    try {
+      const candidate = await fetchImpl(target, {
+        method: "POST",
+        headers: candidateHeaders,
+        body,
+        signal,
+      });
+      if (candidate.ok) return { account, response: candidate, headers: candidateHeaders, lease };
+      const candidateText = await boundedResponseText(candidate, MAX_BUFFERED_RESPONSE_BYTES, signal);
+      await lease.release().catch(() => {});
+      if (!nativeTerminalQuotaFailure({ status: candidate.status, bodyText: candidateText })) return undefined;
+    } catch (error) {
+      await lease.release().catch(() => {});
+      if (signal.aborted) throw error;
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 // The local answer an idle install gives instead of native forwarding. With
 // discovery disabled the native path is impossible by construction -- the
 // session fallback never reads auth.json -- so traffic that would leave for
@@ -4023,6 +4161,7 @@ async function handleResponses(request, response, requestUrl) {
   let retryEmptyCompletionGuard;
   let retryUsage;
   let usage;
+  const requestUseLeases = [];
   let estimatedInputTokens;
   let toolResultAging;
   let pendingInterrupts = [];
@@ -4184,6 +4323,7 @@ async function handleResponses(request, response, requestUrl) {
     let target;
     let headers;
     let routedBody;
+    let nativePortableBody;
     let builtSearchMode;
     let namespacesFlattened = false;
     let flattenedNamespaces = new Map();
@@ -4369,10 +4509,8 @@ async function handleResponses(request, response, requestUrl) {
       }
       target = nativeTarget(requestUrl.pathname);
       headers = nativeHeaders(request);
-      routedBody = await compressedNativeBody(
-        Buffer.from(JSON.stringify(native), "utf8"),
-        headers,
-      );
+      nativePortableBody = Buffer.from(JSON.stringify(native), "utf8");
+      routedBody = await compressedNativeBody(nativePortableBody, headers);
     }
 
     // `routedBody` is a fully materialized Buffer -- plain JSON, or the zstd
@@ -4407,6 +4545,42 @@ async function handleResponses(request, response, requestUrl) {
       },
     );
     upstreamRetries = retries;
+    if (!route && !upstream.ok && requestUrl.pathname.endsWith("/responses")) {
+      let primaryBodyText;
+      try {
+        primaryBodyText = await boundedResponseText(
+          upstream.clone(),
+          MAX_BUFFERED_RESPONSE_BYTES,
+          controller.signal,
+        );
+      } catch {}
+      if (primaryBodyText !== undefined) {
+        const moved = await attemptNativeAccountFailover({
+          request,
+          response,
+          target,
+          headers,
+          body: routedBody,
+          portableBody: nativePortableBody,
+          primaryAccountId: nativeAccountKey(headers),
+          primaryFailure: {
+            status: upstream.status,
+            headers: upstream.headers,
+            bodyText: primaryBodyText,
+          },
+          signal: controller.signal,
+        });
+        if (moved) {
+          upstream = moved.response;
+          headers = moved.headers;
+          if (moved.lease) requestUseLeases.push(moved.lease);
+          // Keep account identities out of logs and response metadata. The
+          // fallback marker is intentionally coarse; detailed account state
+          // remains local to the pool and auth lease layers.
+          failoverFrom = "openai-account-fallback";
+        }
+      }
+    }
     upstreamStatus = upstream.status;
     // Time until the upstream chain answered the request. Everything before
     // this is router-side work (body read, normalization, flattening, vision
@@ -5323,6 +5497,7 @@ async function handleResponses(request, response, requestUrl) {
     }
     throw error;
   } finally {
+    await Promise.all(requestUseLeases.map((lease) => lease.release().catch(() => false)));
     const status = activityStatus ?? finalStatus ?? response.statusCode;
     activity.finish(status);
     // Timestamped per-request timing for latency diagnosis. Never gated on
@@ -5953,8 +6128,10 @@ process.on("unhandledRejection", (reason) => {
 });
 server.requestTimeout = 0;
 applyKeepAliveTimeouts(server);
-server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.error("[codex-router] listening");
-});
+if (process.env.MODEL_ROUTER_TEST_HELPERS !== "1") {
+  server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+    console.error("[codex-router] listening");
+  });
 
-installGracefulShutdown(server, { label: "codex-router" });
+  installGracefulShutdown(server, { label: "codex-router" });
+}

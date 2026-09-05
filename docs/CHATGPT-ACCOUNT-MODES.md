@@ -1,6 +1,6 @@
 # ChatGPT native account switching
 
-Codex Router keeps each ChatGPT login in its own isolated profile. The feature is deliberately switch-only: selecting an account changes the native Codex login for the next restart. It does not run automatic quota or round-robin routing.
+Codex Router keeps each ChatGPT login in its own isolated profile. Selecting an account changes the native Codex login for the next restart. On macOS and Linux, an explicit opt-in strict-priority fallback can try up to two enrolled backup accounts after a terminal OpenAI quota response; it is never round-robin routing. Windows remains switch-only.
 
 ## Select an account
 
@@ -11,6 +11,13 @@ Choose a saved account from the account list in Control Center. The selected log
 Each account keeps its own native model catalog and routed model overlay. Switching restores that account's catalog, so models unavailable to one ChatGPT plan are not shown as available under another plan. External provider credentials and subagent routes are preserved.
 
 ## Usage
+
+Fallback is disabled by default. After at least one backup account has a healthy protected session and a fresh catalog, enable it with `control chatgpt-account-pool fallback on`; inspect or disable it with `fallback status` or `fallback off`. Only the selected account may be enabled as the primary, and ordinary auth, entitlement, transport, and malformed-request failures stay on the original account.
+
+Only a fresh, portable first turn can cross accounts. Turns carrying opaque
+transcript state (for example turn-state, attestation, continuation, file, or
+compaction references) stay on the original account; task-family affinity is
+not persisted by this bounded implementation.
 
 Control Center reads usage from up to eight saved, usable accounts' isolated `CODEX_HOME` directories, prioritizing the selected account. It shows the weekly window when OpenAI reports one, otherwise the monthly window. Returning to another account reloads that account's quota and reset time.
 

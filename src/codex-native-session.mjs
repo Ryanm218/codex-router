@@ -6,6 +6,13 @@ import { discoveryDisabled } from "./discovery-mode.mjs";
 import { writePrivateJson } from "./file-security.mjs";
 import { CODEX_HOME, NATIVE_SESSION_CONSENT_PATH } from "./paths.mjs";
 
+export {
+  attestChatGPTAccount,
+  chatGPTAccountRequestAuthSupported,
+  readProtectedChatGPTSessionDescriptor,
+  snapshotChatGPTRequestAuth,
+} from "./chatgpt-account-auth.mjs";
+
 // The ChatGPT session the local Codex install already holds.
 //
 // Native GPT traffic is authorized by the caller's own session: `nativeHeaders`

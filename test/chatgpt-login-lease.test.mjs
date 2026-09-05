@@ -20,6 +20,7 @@ import {
   createChatGPTSubscriptionAccount,
   readChatGPTAccountPoolState,
 } from "../src/chatgpt-account-pool.mjs";
+import { createRequestUseLease } from "../src/chatgpt-request-use-lease.mjs";
 import { removeChatGPTProfileAccount } from "../src/chatgpt-profile-switch.mjs";
 import { protectPrivateFile } from "../src/file-security.mjs";
 
@@ -43,6 +44,33 @@ function fixture() {
   };
   return { root, options };
 }
+
+test("an active browser-login lease excludes request-use lease creation", async () => {
+  const { options } = fixture();
+  const account = createChatGPTSubscriptionAccount(options);
+  const identity = () => "login-owner";
+  const lease = createChatGPTLoginLease(account.id, process.pid, {
+    homesDir: options.homesDir,
+    identity,
+  });
+  try {
+    await assert.rejects(
+      createRequestUseLease({
+        accountId: account.id,
+        affinityGeneration: "abcdefghijklmnopqrstuv",
+        requestStartedWallMs: 1_000,
+        filePath: options.filePath,
+        homesDir: options.homesDir,
+        identity,
+        loginLeaseIdentity: identity,
+        identityProbe: () => ({ state: "alive", identity: "login-owner" }),
+      }),
+      /browser sign-in|login/i,
+    );
+  } finally {
+    assert.equal(clearChatGPTLoginLease(account.id, lease, options), true);
+  }
+});
 
 test("core removal refuses a durable login owner after the GUI lifecycle is gone", async () => {
   const { options } = fixture();

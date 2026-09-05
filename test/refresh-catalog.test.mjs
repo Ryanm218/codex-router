@@ -13,6 +13,11 @@ const noJournal = {
 };
 const noLock = (operation) => operation();
 const noAccountRefresh = async () => ({ status: "unavailable" });
+const safeRefreshCatalog = (options = {}) => refreshCatalog({
+  readAccountPool: () => ({ accounts: {} }),
+  captureAccountCatalog: async () => {},
+  ...options,
+});
 
 function recordingRunner({
   signed = true,
@@ -54,7 +59,7 @@ function recordingRunner({
 
 test("ordinary routed refresh avoids config mutation when the native cache is safe", async () => {
   const runner = recordingRunner();
-  const result = await refreshCatalog({
+  const result = await safeRefreshCatalog({
     canRefreshInPlace: () => true,
     refreshAccountCatalog: noAccountRefresh,
     run: runner.run,
@@ -92,7 +97,7 @@ test("refresh completion distinguishes live account success, fallback, and disab
 
 test("refresh orchestration restores signed routing and republishes the routed catalog", async () => {
   const runner = recordingRunner();
-  const result = await refreshCatalog({
+  const result = await safeRefreshCatalog({
     canRefreshInPlace: () => false,
     refreshAccountCatalog: noAccountRefresh,
     run: runner.run,
@@ -112,7 +117,7 @@ test("refresh orchestration restores signed routing and republishes the routed c
 test("refresh orchestration restores the active transport after catalog failure", async () => {
   const runner = recordingRunner({ failAt: 3 });
   await assert.rejects(
-    refreshCatalog({
+    safeRefreshCatalog({
       canRefreshInPlace: () => false,
       refreshAccountCatalog: noAccountRefresh,
       run: runner.run,
@@ -150,7 +155,7 @@ test("refresh restores a provider-switch signed mode without changing its mode",
 
 test("ordinary routed refresh also republishes external models after restore", async () => {
   const runner = recordingRunner({ signed: false });
-  await refreshCatalog({
+  await safeRefreshCatalog({
     canRefreshInPlace: () => false,
     refreshAccountCatalog: noAccountRefresh,
     run: runner.run,
@@ -171,7 +176,7 @@ test("refresh orchestration restores identity-preserving login-free mode and its
     loginFree: true,
     model: "gpt-5.6-sol",
   });
-  await refreshCatalog({
+  await safeRefreshCatalog({
     canRefreshInPlace: () => true,
     refreshAccountCatalog: noAccountRefresh,
     run: runner.run,
@@ -213,7 +218,7 @@ test("pending refresh resumes and completes only with an alias for the same cano
     canonicalModel: "deepseek/deepseek-v4-pro",
     displayModel: "old-alias",
   };
-  await refreshCatalog({
+  await safeRefreshCatalog({
     canRefreshInPlace: () => true,
     refreshAccountCatalog: noAccountRefresh,
     run: runner.run,
@@ -248,4 +253,25 @@ test("pending refresh resumes and completes only with an alias for the same cano
       ["login-free-enable", "fresh-alias", "--complete-login-free-refresh"],
     ],
   ]);
+});
+
+test("account catalog capture is injected and skips inactive profiles", async () => {
+  for (const inPlace of [true, false]) {
+    const runner = recordingRunner({ signed: false });
+    const captured = [];
+    await safeRefreshCatalog({
+      canRefreshInPlace: () => inPlace,
+      run: runner.run,
+      lock: noLock,
+      readAccountPool: () => ({
+        accounts: {
+          acct_active_12345678: { id: "acct_active_12345678", state: "active", paused: false },
+          acct_paused_12345678: { id: "acct_paused_12345678", state: "active", paused: true },
+          acct_revoked_12345678: { id: "acct_revoked_12345678", state: "revoked", paused: false },
+        },
+      }),
+      captureAccountCatalog: async (accountId) => { captured.push(accountId); },
+    });
+    assert.deepEqual(captured, ["acct_active_12345678"]);
+  }
 });

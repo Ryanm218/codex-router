@@ -19,6 +19,14 @@ import {
   createChatGPTLoginLease,
 } from "./chatgpt-login-lease.mjs";
 import { ensureNoSymlinkParents } from "./path-security.mjs";
+import {
+  withChatGPTAccountOperationLock,
+  withChatGPTAccountOperationLockSync,
+} from "./chatgpt-account-operation-lock.mjs";
+import {
+  assertNoActiveRequestUseLeases,
+  assertNoChatGPTProfileSwitchReservation,
+} from "./chatgpt-request-use-lease.mjs";
 
 export const CHATGPT_ACCOUNT_POOL_SCHEMA_VERSION = 1;
 
@@ -32,6 +40,45 @@ export const ACCOUNT_REFRESH_RETRY_MS = 5 * 60 * 1000;
 export const ACCOUNT_REFRESH_POLL_LIMIT = 8;
 export const ACCOUNT_REFRESH_POLL_CONCURRENCY = 2;
 const ACCOUNT_REFRESH_TIMEOUT_MS = 30_000;
+const FALLBACK_AFFINITY_TTL_SECONDS = 7 * 24 * 60 * 60;
+const FALLBACK_CATALOG_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const FALLBACK_MAX_HOPS = 2;
+const FALLBACK_POLICY_KEYS = new Set(["enabled", "strategy", "maxHops", "affinityTtlSeconds"]);
+const POLICY_KEYS = new Set(["enabled", "mode", "selectedAccountId", "fallback"]);
+const FALLBACK_OBSERVATION_KEYS = new Set(["enabled", "quota", "catalog"]);
+const FALLBACK_QUOTA_KEYS = new Set(["state", "observedAt", "cooldownUntil"]);
+const FALLBACK_CATALOG_KEYS = new Set(["state", "generation", "capturedAt", "lastAttemptAt", "lastResult"]);
+const AFFINITY_SESSION_KEYS = new Set(["version", "epoch", "bindings", "aliases", "quarantine"]);
+const AFFINITY_QUARANTINE_KEYS = new Set(["state", "detectedAt", "bindingCount", "aliasCount"]);
+const AFFINITY_EPOCH = /^[A-Za-z0-9_-]{22}$/;
+const AFFINITY_DIGEST = /^[A-Za-z0-9_-]{43}$/;
+const AFFINITY_RECORD_LIMIT = 2_048;
+const RESERVED_BINDING_KEYS = new Set([
+  "state", "generation", "createdAt", "lastUsedAt", "requests", "turns", "reason",
+  "accountId", "reservedUntil",
+]);
+const BOUND_BINDING_KEYS = new Set([
+  "state", "generation", "createdAt", "lastUsedAt", "requests", "turns", "reason",
+  "accountId", "boundAt", "expiresAt",
+]);
+const TOMBSTONE_BINDING_KEYS = new Set([
+  "state", "generation", "createdAt", "lastUsedAt", "requests", "turns", "reason",
+  "tombstonedAt",
+]);
+const LIVE_ALIAS_KEYS = new Set(["state", "rootDigest", "createdAt", "lastUsedAt", "expiresAt"]);
+const TOMBSTONE_ALIAS_KEYS = new Set(["state", "rootDigest", "createdAt", "lastUsedAt", "tombstonedAt"]);
+const LIVE_BINDING_REASONS = new Set(["terminal-quota", "inherited", "operator"]);
+const TOMBSTONE_BINDING_REASONS = new Set([
+  "account-removed", "account-revoked", "account-paused", "fallback-disabled",
+  "binding-expired", "operator-cleared", "reservation-owner-lost",
+]);
+const FALLBACK_CATALOG_RESULTS = new Set([
+  "never", "ok", "last-known-good", "missing", "invalid", "incompatible",
+  "too-old", "reauth-required", "login-busy", "request-in-use",
+  "refresh-pending", "skipped-user-owned-source", "skipped-discovery-disabled",
+  "unsupported-platform", "unsupported-cache-schema", "probe-failed",
+  "publication-failed", "identity-changed", "cancelled-relaunch",
+]);
 
 function terminateRefreshProcessTree(child, {
   viaShell,
@@ -89,10 +136,282 @@ function accountId(value) {
 }
 export function isChatGPTAccountId(value) { return typeof value === "string" && ACCOUNT_ID.test(value.trim()); }
 
+function hasOnlyKeys(value, allowed) {
+  return plainObject(value) && Object.keys(value).every((key) => allowed.has(key));
+}
+
+function fallbackPolicyDefaults() {
+  return {
+    enabled: false,
+    strategy: "strict-priority",
+    maxHops: FALLBACK_MAX_HOPS,
+    affinityTtlSeconds: FALLBACK_AFFINITY_TTL_SECONDS,
+  };
+}
+
+export function normalizeFallbackPolicy(value) {
+  if (value === undefined) return fallbackPolicyDefaults();
+  if (!hasOnlyKeys(value, FALLBACK_POLICY_KEYS)) return fallbackPolicyDefaults();
+  const normalized = { ...fallbackPolicyDefaults(), ...value };
+  if (
+    typeof normalized.enabled !== "boolean"
+    || normalized.strategy !== "strict-priority"
+    || !Number.isSafeInteger(normalized.maxHops)
+    || normalized.maxHops < 0
+    || normalized.maxHops > FALLBACK_MAX_HOPS
+    || normalized.affinityTtlSeconds !== FALLBACK_AFFINITY_TTL_SECONDS
+  ) return fallbackPolicyDefaults();
+  return normalized;
+}
+
+function fallbackObservationDefaults(enabled) {
+  return {
+    enabled,
+    quota: { state: "unknown" },
+    catalog: { state: "missing", lastResult: "never" },
+  };
+}
+
+function normalizedOptionalIso(value) {
+  if (value === undefined) return { valid: true, value: undefined };
+  const normalized = iso(value);
+  return { valid: Boolean(normalized), value: normalized };
+}
+
+export function normalizeFallbackObservation(value) {
+  if (value === undefined) return fallbackObservationDefaults(true);
+  const invalid = () => fallbackObservationDefaults(false);
+  if (!hasOnlyKeys(value, FALLBACK_OBSERVATION_KEYS)) return invalid();
+  const enabled = value.enabled === undefined ? true : value.enabled;
+  if (typeof enabled !== "boolean") return invalid();
+
+  const quota = value.quota === undefined ? { state: "unknown" } : value.quota;
+  if (!hasOnlyKeys(quota, FALLBACK_QUOTA_KEYS)) return invalid();
+  const quotaState = quota.state === undefined ? "unknown" : quota.state;
+  if (!["clear", "cooldown", "unknown"].includes(quotaState)) return invalid();
+  const observedAt = normalizedOptionalIso(quota.observedAt);
+  const cooldownUntil = quota.cooldownUntil === null
+    ? { valid: true, value: null }
+    : normalizedOptionalIso(quota.cooldownUntil);
+  if (!observedAt.valid || !cooldownUntil.valid) return invalid();
+
+  const catalog = value.catalog === undefined
+    ? { state: "missing", lastResult: "never" }
+    : value.catalog;
+  if (!hasOnlyKeys(catalog, FALLBACK_CATALOG_KEYS)) return invalid();
+  const catalogState = catalog.state === undefined ? "missing" : catalog.state;
+  const lastResult = catalog.lastResult === undefined ? "never" : catalog.lastResult;
+  if (
+    !["ready", "missing", "stale", "invalid", "refresh-pending"].includes(catalogState)
+    || !FALLBACK_CATALOG_RESULTS.has(lastResult)
+  ) return invalid();
+  const generation = text(catalog.generation);
+  if (
+    catalog.generation !== undefined
+    && (!generation || generation.length > 256 || /[\u0000-\u001f\u007f]/.test(generation))
+  ) return invalid();
+  const capturedAt = normalizedOptionalIso(catalog.capturedAt);
+  const lastAttemptAt = normalizedOptionalIso(catalog.lastAttemptAt);
+  if (!capturedAt.valid || !lastAttemptAt.valid) return invalid();
+
+  return {
+    enabled,
+    quota: {
+      state: quotaState,
+      ...(observedAt.value ? { observedAt: observedAt.value } : {}),
+      ...(cooldownUntil.value !== undefined ? { cooldownUntil: cooldownUntil.value } : {}),
+    },
+    catalog: {
+      state: catalogState,
+      ...(generation ? { generation } : {}),
+      ...(capturedAt.value ? { capturedAt: capturedAt.value } : {}),
+      ...(lastAttemptAt.value ? { lastAttemptAt: lastAttemptAt.value } : {}),
+      lastResult,
+    },
+  };
+}
+
+function canonicalIso(value) {
+  return typeof value === "string" && iso(value) === value;
+}
+
+function exactKeys(value, expected) {
+  return hasOnlyKeys(value, expected) && Object.keys(value).length === expected.size;
+}
+
+function validAffinityCommon(value, expectedKeys, reasons) {
+  return exactKeys(value, expectedKeys)
+    && AFFINITY_EPOCH.test(value.generation)
+    && canonicalIso(value.createdAt)
+    && canonicalIso(value.lastUsedAt)
+    && Number.isSafeInteger(value.requests)
+    && value.requests >= 0
+    && Number.isSafeInteger(value.turns)
+    && value.turns >= 0
+    && reasons.has(value.reason);
+}
+
+function normalizeAffinityBinding(value) {
+  if (!plainObject(value)) return undefined;
+  let expectedKeys;
+  let reasons;
+  if (value.state === "reserved") {
+    expectedKeys = RESERVED_BINDING_KEYS;
+    reasons = LIVE_BINDING_REASONS;
+  } else if (value.state === "bound") {
+    expectedKeys = BOUND_BINDING_KEYS;
+    reasons = LIVE_BINDING_REASONS;
+  } else if (value.state === "tombstone") {
+    expectedKeys = TOMBSTONE_BINDING_KEYS;
+    reasons = TOMBSTONE_BINDING_REASONS;
+  } else {
+    return undefined;
+  }
+  if (!validAffinityCommon(value, expectedKeys, reasons)) return undefined;
+  if (value.state === "reserved") {
+    if (!ACCOUNT_ID.test(value.accountId) || !canonicalIso(value.reservedUntil)) return undefined;
+  } else if (value.state === "bound") {
+    if (
+      !ACCOUNT_ID.test(value.accountId)
+      || !canonicalIso(value.boundAt)
+      || !canonicalIso(value.expiresAt)
+    ) return undefined;
+  } else if (!canonicalIso(value.tombstonedAt)) {
+    return undefined;
+  }
+  return { ...value };
+}
+
+function normalizeAffinityBindings(value) {
+  if (!plainObject(value)) return undefined;
+  const entries = Object.entries(value);
+  if (entries.length > AFFINITY_RECORD_LIMIT) return undefined;
+  const normalized = {};
+  for (const [digest, record] of entries) {
+    if (!AFFINITY_DIGEST.test(digest)) return undefined;
+    const binding = normalizeAffinityBinding(record);
+    if (!binding) return undefined;
+    normalized[digest] = binding;
+  }
+  return normalized;
+}
+
+function normalizeAffinityAlias(value, bindingDigests) {
+  if (!plainObject(value) || !bindingDigests.has(value.rootDigest)) return undefined;
+  if (value.state === "live") {
+    if (
+      !exactKeys(value, LIVE_ALIAS_KEYS)
+      || !AFFINITY_DIGEST.test(value.rootDigest)
+      || !canonicalIso(value.createdAt)
+      || !canonicalIso(value.lastUsedAt)
+      || !canonicalIso(value.expiresAt)
+    ) return undefined;
+  } else if (value.state === "tombstone") {
+    if (
+      !exactKeys(value, TOMBSTONE_ALIAS_KEYS)
+      || !AFFINITY_DIGEST.test(value.rootDigest)
+      || !canonicalIso(value.createdAt)
+      || !canonicalIso(value.lastUsedAt)
+      || !canonicalIso(value.tombstonedAt)
+    ) return undefined;
+  } else {
+    return undefined;
+  }
+  return { ...value };
+}
+
+function normalizeAffinityAliases(value, bindings) {
+  if (!plainObject(value)) return undefined;
+  const entries = Object.entries(value);
+  if (entries.length + Object.keys(bindings).length > AFFINITY_RECORD_LIMIT) return undefined;
+  const bindingDigests = new Set(Object.keys(bindings));
+  const normalized = {};
+  for (const [digest, record] of entries) {
+    if (!AFFINITY_DIGEST.test(digest) || bindingDigests.has(digest)) return undefined;
+    const alias = normalizeAffinityAlias(record, bindingDigests);
+    if (!alias) return undefined;
+    normalized[digest] = alias;
+  }
+  return normalized;
+}
+
+function normalizeAffinityQuarantine(value) {
+  if (value === null) return null;
+  if (!hasOnlyKeys(value, AFFINITY_QUARANTINE_KEYS)) return undefined;
+  if (
+    value.state !== "affinity-secret-invalid"
+    || !canonicalIso(value.detectedAt)
+    || !Number.isSafeInteger(value.bindingCount)
+    || value.bindingCount < 0
+    || !Number.isSafeInteger(value.aliasCount)
+    || value.aliasCount < 0
+  ) return undefined;
+  return {
+    state: value.state,
+    detectedAt: value.detectedAt,
+    bindingCount: value.bindingCount,
+    aliasCount: value.aliasCount,
+  };
+}
+
+export function normalizeAffinitySessions(value) {
+  if (value === undefined || (plainObject(value) && Object.keys(value).length === 0)) return {};
+  if (!hasOnlyKeys(value, AFFINITY_SESSION_KEYS)) return undefined;
+  if (
+    Object.keys(value).length !== AFFINITY_SESSION_KEYS.size
+    || value.version !== 1
+    || !AFFINITY_EPOCH.test(value.epoch)
+  ) return undefined;
+  const bindings = normalizeAffinityBindings(value.bindings);
+  if (!bindings) return undefined;
+  const aliases = normalizeAffinityAliases(value.aliases, bindings);
+  if (!aliases) return undefined;
+  const quarantine = normalizeAffinityQuarantine(value.quarantine);
+  if (quarantine === undefined) return undefined;
+  return {
+    version: 1,
+    epoch: value.epoch,
+    bindings,
+    aliases,
+    quarantine,
+  };
+}
+
+function quarantinedAffinitySessions(value) {
+  const saved = plainObject(value) ? normalizeAffinityQuarantine(value.quarantine) : undefined;
+  const quarantine = saved || {
+    state: "affinity-secret-invalid",
+    detectedAt: isoNow(),
+    bindingCount: plainObject(value?.bindings)
+      ? Math.min(Object.keys(value.bindings).length, Number.MAX_SAFE_INTEGER)
+      : 0,
+    aliasCount: plainObject(value?.aliases)
+      ? Math.min(Object.keys(value.aliases).length, Number.MAX_SAFE_INTEGER)
+      : 0,
+  };
+  return {
+    version: 1,
+    epoch: plainObject(value) && AFFINITY_EPOCH.test(value.epoch)
+      ? value.epoch
+      : randomBytes(16).toString("base64url"),
+    bindings: {},
+    aliases: {},
+    quarantine,
+  };
+}
+
 function normalizePolicy(raw = {}) {
   const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const selected = text(source.selectedAccountId);
-  return { enabled: source.enabled !== false, mode: "switch", ...(ACCOUNT_ID.test(selected) ? { selectedAccountId: selected } : {}) };
+  const fallback = hasOnlyKeys(source, POLICY_KEYS)
+    ? normalizeFallbackPolicy(source.fallback)
+    : fallbackPolicyDefaults();
+  return {
+    enabled: source.enabled !== false,
+    mode: "switch",
+    ...(ACCOUNT_ID.test(selected) ? { selectedAccountId: selected } : {}),
+    fallback,
+  };
 }
 function normalizeIdentity(raw) {
   const value = text(raw?.accountId);
@@ -141,12 +460,22 @@ function normalizeAccount(raw, id) {
     ...(iso(raw.createdAt) ? { createdAt: iso(raw.createdAt) } : {}),
     ...(identity ? { identity } : {}),
     ...(subscription ? { subscription } : {}),
+    ...(raw.fallback !== undefined ? { fallback: normalizeFallbackObservation(raw.fallback) } : {}),
     health: normalizeHealth(raw.health),
     turns: integer(raw.turns, 0),
     requests: integer(raw.requests, 0),
   };
 }
-function emptyState() { return { version: CHATGPT_ACCOUNT_POOL_SCHEMA_VERSION, policy: normalizePolicy(), accounts: {}, sessions: {} }; }
+function emptyState() {
+  return {
+    version: CHATGPT_ACCOUNT_POOL_SCHEMA_VERSION,
+    policy: normalizePolicy(),
+    accounts: {},
+    sessions: {},
+    explicitSwitchUsable: true,
+    affinityQuarantine: null,
+  };
+}
 function plainObject(value) { return Boolean(value) && typeof value === "object" && !Array.isArray(value); }
 
 function invalidPoolState(reason) {
@@ -167,7 +496,6 @@ function validatePersistedState(raw) {
     && !isChatGPTAccountId(raw.policy.selectedAccountId)
   ) invalidPoolState("the selected account id is malformed");
   if (!plainObject(raw.accounts)) invalidPoolState("accounts must be an object");
-  if (!plainObject(raw.sessions)) invalidPoolState("sessions must be an object");
   const entries = Object.entries(raw.accounts);
   if (entries.length > MAX_ACCOUNTS) invalidPoolState(`more than ${MAX_ACCOUNTS} accounts are present`);
   for (const [id, account] of entries) {
@@ -200,7 +528,7 @@ function validatePersistedState(raw) {
   return raw;
 }
 
-function normalizeState(raw) {
+export function normalizeState(raw) {
   const result = emptyState();
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return result;
   result.policy = normalizePolicy(raw.policy);
@@ -208,6 +536,14 @@ function normalizeState(raw) {
     if (!ACCOUNT_ID.test(id)) continue;
     const account = normalizeAccount(value, id);
     if (account) result.accounts[id] = account;
+  }
+  const sessions = normalizeAffinitySessions(raw.sessions);
+  if (sessions === undefined) {
+    result.sessions = quarantinedAffinitySessions(raw.sessions);
+    result.affinityQuarantine = result.sessions.quarantine;
+  } else {
+    result.sessions = sessions;
+    result.affinityQuarantine = sessions.quarantine || null;
   }
   return result;
 }
@@ -234,7 +570,12 @@ export function readChatGPTAccountPoolState(filePath = CHATGPT_ACCOUNT_POOL_PATH
 export function writeChatGPTAccountPoolState(state, filePath = CHATGPT_ACCOUNT_POOL_PATH) {
   assertAccountDiscoveryEnabled();
   const normalized = normalizeState({ ...state, version: CHATGPT_ACCOUNT_POOL_SCHEMA_VERSION });
-  writePrivateJson(filePath, normalized, { directoryMode: 0o700 });
+  writePrivateJson(filePath, {
+    version: normalized.version,
+    policy: normalized.policy,
+    accounts: normalized.accounts,
+    sessions: normalized.sessions,
+  }, { directoryMode: 0o700 });
   return normalized;
 }
 
@@ -296,13 +637,14 @@ export function createChatGPTSubscriptionAccount({ label = "", filePath = CHATGP
 export function chatGPTSubscriptionAccountHome(accountValue, { homesDir = CHATGPT_ACCOUNT_HOMES_DIR } = {}) { return path.join(homesDir, accountId(accountValue)); }
 export function chatGPTSubscriptionAccountAuthPath(accountValue, options = {}) { return path.join(chatGPTSubscriptionAccountHome(accountValue, options), "auth.json"); }
 export function chatGPTSubscriptionAccountCatalogDir(accountValue, options = {}) { return path.join(chatGPTSubscriptionAccountHome(accountValue, options), "router-catalog"); }
-export function removeChatGPTSubscriptionAccount(accountValue, {
+export function removeChatGPTSubscriptionAccountLocked(accountValue, {
   filePath = CHATGPT_ACCOUNT_POOL_PATH,
   homesDir = CHATGPT_ACCOUNT_HOMES_DIR,
   selectedAccountId,
   loginLeaseIdentity,
   now = Date.now(),
   loginLeaseMaxAgeMs,
+  requestLeaseIdentityProbe,
 } = {}) {
   const id = accountId(accountValue);
   const state = readChatGPTAccountPoolState(filePath);
@@ -313,6 +655,11 @@ export function removeChatGPTSubscriptionAccount(accountValue, {
     ...(loginLeaseIdentity ? { identity: loginLeaseIdentity } : {}),
     now,
     ...(loginLeaseMaxAgeMs === undefined ? {} : { maxAgeMs: loginLeaseMaxAgeMs }),
+  });
+  assertNoActiveRequestUseLeases(id, {
+    homesDir,
+    ...(requestLeaseIdentityProbe ? { identityProbe: requestLeaseIdentityProbe } : {}),
+    now,
   });
   delete state.accounts[id];
   if (selectedAccountId !== undefined) {
@@ -385,6 +732,26 @@ export function removeChatGPTSubscriptionAccount(accountValue, {
     } catch {}
   }
   return sanitizeChatGPTAccount({ ...removed, state: "revoked", paused: true });
+}
+
+export function removeChatGPTSubscriptionAccount(accountValue, options = {}) {
+  const id = accountId(accountValue);
+  const filePath = options.filePath || CHATGPT_ACCOUNT_POOL_PATH;
+  try {
+    return withChatGPTAccountPoolLockSync(
+      () => withChatGPTAccountOperationLockSync(
+        id,
+        () => removeChatGPTSubscriptionAccountLocked(id, options),
+        options,
+      ),
+      { filePath, ...options },
+    );
+  } catch (error) {
+    if (/account operation lock (root|account home)/i.test(error?.message || "")) {
+      throw new Error("ChatGPT account removal target is not an owned private directory.", { cause: error });
+    }
+    throw error;
+  }
 }
 
 function tokenExpiryMs(accessToken) {
@@ -463,16 +830,21 @@ export async function claimChatGPTSubscriptionRefresh(accountValue, {
   now = Date.now(),
 } = {}) {
   const id = accountId(accountValue);
-  return withChatGPTAccountPoolLock(() => {
-    const state = readChatGPTAccountPoolState(filePath);
-    const account = state.accounts[id];
-    if (!account || account.state !== "active" || account.paused) return false;
-    const attemptedAt = Date.parse(account.health?.lastRefreshAttemptAt || "");
-    if (!force && Number.isFinite(attemptedAt) && now - attemptedAt < ACCOUNT_REFRESH_RETRY_MS) return false;
-    account.health = { ...account.health, lastRefreshAttemptAt: isoNow(now) };
-    writeChatGPTAccountPoolState(state, filePath);
-    return true;
-  }, { filePath });
+  return withChatGPTAccountPoolLock(
+    () => claimChatGPTSubscriptionRefreshLocked(id, { filePath, force, now }),
+    { filePath },
+  );
+}
+
+function claimChatGPTSubscriptionRefreshLocked(id, { filePath, force, now }) {
+  const state = readChatGPTAccountPoolState(filePath);
+  const account = state.accounts[id];
+  if (!account || account.state !== "active" || account.paused) return false;
+  const attemptedAt = Date.parse(account.health?.lastRefreshAttemptAt || "");
+  if (!force && Number.isFinite(attemptedAt) && now - attemptedAt < ACCOUNT_REFRESH_RETRY_MS) return false;
+  account.health = { ...account.health, lastRefreshAttemptAt: isoNow(now) };
+  writeChatGPTAccountPoolState(state, filePath);
+  return true;
 }
 
 export async function refreshChatGPTSubscriptionAccount(accountValue, {
@@ -490,6 +862,8 @@ export async function refreshChatGPTSubscriptionAccount(accountValue, {
   attachLoginLease = attachChatGPTLoginLease,
   clearLoginLease = clearChatGPTLoginLease,
   finalizeLogin,
+  requestLeaseIdentityProbe,
+  switchPath,
 } = {}) {
   assertAccountDiscoveryEnabled();
   const id = accountId(accountValue);
@@ -498,10 +872,28 @@ export async function refreshChatGPTSubscriptionAccount(accountValue, {
   if (!force && !status.expired && !expiresSoon) return false;
   const resolvedBinary = binary || findCodexBinary();
   if (!resolvedBinary) return false;
-  if (!await claimChatGPTSubscriptionRefresh(id, { filePath, force, now })) return false;
+  let reservedLease;
+  try {
+    reservedLease = await withChatGPTAccountPoolLock(
+      () => withChatGPTAccountOperationLock(id, () => {
+        assertNoChatGPTProfileSwitchReservation({ switchPath });
+        assertNoActiveRequestUseLeases(id, {
+          homesDir,
+          ...(requestLeaseIdentityProbe ? { identityProbe: requestLeaseIdentityProbe } : {}),
+          now,
+        });
+        if (!claimChatGPTSubscriptionRefreshLocked(id, { filePath, force, now })) return undefined;
+        return createLoginLease(id, process.pid, { homesDir, phase: "reserved" });
+      }, { homesDir }),
+      { filePath },
+    );
+  } catch {
+    return false;
+  }
+  if (!reservedLease) return false;
   const target = spawnableCommand(resolvedBinary, ["login", "status"], platform);
   return new Promise((resolve) => {
-    let lease;
+    let lease = reservedLease;
     let child;
     let childFinished = false;
     let leaseReady = false;
@@ -540,7 +932,6 @@ export async function refreshChatGPTSubscriptionAccount(accountValue, {
       }
     };
     try {
-      lease = createLoginLease(id, process.pid, { homesDir, phase: "reserved" });
       child = spawnImpl(
         target.command,
         target.args,
@@ -694,6 +1085,43 @@ export function sanitizeChatGPTAccountPool(state) {
     accounts: Object.fromEntries(Object.entries(normalized.accounts).map(([id, account]) => [id, sanitizeChatGPTAccount(account)])), sessions: {},
   };
 }
+
+// Read-only strict-priority candidates for the native request path. This
+// intentionally accepts only accounts whose persisted observation is ready
+// and no more than seven days old; the request path performs a fresh
+// protected-auth attestation before sending.
+export function eligibleChatGPTFallbackAccounts({
+  pool,
+  primaryAccountId,
+  now = Date.now(),
+  subscriptionStatus,
+} = {}) {
+  const state = normalizeState(pool);
+  if (state.policy.fallback?.enabled !== true) return [];
+  return Object.values(state.accounts)
+    .filter((account) => account.identity?.accountId && account.identity.accountId !== primaryAccountId)
+    .filter((account) => account.state === "active" && account.paused !== true)
+    .filter((account) => account.health?.state === "healthy")
+    .filter((account) => {
+      if (account.subscription?.status === "usable") return true;
+      if (typeof subscriptionStatus !== "function") return false;
+      try { return subscriptionStatus(account.id)?.usable === true; } catch { return false; }
+    })
+    .filter((account) => account.fallback?.enabled !== false)
+    .filter((account) => account.fallback?.catalog?.state === "ready")
+    .filter((account) => {
+      const capturedAt = Date.parse(account.fallback?.catalog?.capturedAt || "");
+      return Number.isFinite(capturedAt)
+        && capturedAt <= now
+        && now - capturedAt <= FALLBACK_CATALOG_MAX_AGE_MS;
+    })
+    .filter((account) => {
+      const cooldown = Date.parse(account.fallback?.quota?.cooldownUntil || "");
+      return !Number.isFinite(cooldown) || cooldown <= now;
+    })
+    .sort((left, right) => Number(left.priority) - Number(right.priority) || left.id.localeCompare(right.id))
+    .slice(0, state.policy.fallback.maxHops);
+}
 export async function withChatGPTAccountPoolLock(operation, { filePath = CHATGPT_ACCOUNT_POOL_PATH, waitMs = 120_000, retryMs = 25, staleMs = 10 * 60_000 } = {}) {
   assertAccountDiscoveryEnabled();
   const lockTarget = `${filePath}.pool-lock`;
@@ -705,4 +1133,26 @@ export async function withChatGPTAccountPoolLock(operation, { filePath = CHATGPT
     release = await lockfile.lock(lockTarget, { realpath: false, lockfilePath: lockPath, stale: Math.max(2_000, staleMs), retries: { retries, factor: 1, minTimeout: retryMs, maxTimeout: retryMs, randomize: false } });
     return await operation();
   } finally { if (release) await release().catch(() => {}); }
+}
+
+function withChatGPTAccountPoolLockSync(operation, { filePath = CHATGPT_ACCOUNT_POOL_PATH, staleMs = 10 * 60_000 } = {}) {
+  assertAccountDiscoveryEnabled();
+  const lockTarget = `${filePath}.pool-lock`;
+  const lockPath = `${lockTarget}.lock`;
+  mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  let release;
+  try {
+    release = lockfile.lockSync(lockTarget, {
+      realpath: false,
+      lockfilePath: lockPath,
+      stale: Math.max(2_000, staleMs),
+      update: false,
+      retries: 0,
+    });
+    return operation();
+  } finally {
+    if (release) {
+      try { release(); } catch {}
+    }
+  }
 }

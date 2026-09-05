@@ -7,6 +7,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
+import * as accountPoolModule from "../src/chatgpt-account-pool.mjs";
 import {
   ACCOUNT_REFRESH_POLL_CONCURRENCY,
   ACCOUNT_REFRESH_POLL_LIMIT,
@@ -17,6 +18,7 @@ import {
   chatGPTSubscriptionAccountPoolSnapshot,
   chatGPTSubscriptionAccountStatus,
   createChatGPTSubscriptionAccount,
+  eligibleChatGPTFallbackAccounts,
   readChatGPTAccountPoolState,
   refreshChatGPTSubscriptionAccount,
   refreshBoundedChatGPTSubscriptionAccounts,
@@ -79,6 +81,213 @@ function fixture() {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-account-store-"));
   return { root, filePath: path.join(root, "accounts.json"), homesDir: path.join(root, "homes") };
 }
+
+function writePool(options, value) {
+  writeFileSync(options.filePath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+}
+
+const ROOT_DIGEST = "A".repeat(43);
+const CHILD_DIGEST = "B".repeat(43);
+const GENERATION = "C".repeat(22);
+const SESSION_EPOCH = "D".repeat(22);
+const CREATED_AT = "2026-09-05T00:00:00.000Z";
+
+function boundRecord(overrides = {}) {
+  return {
+    state: "bound",
+    generation: GENERATION,
+    createdAt: CREATED_AT,
+    lastUsedAt: CREATED_AT,
+    requests: 1,
+    turns: 1,
+    reason: "terminal-quota",
+    accountId: "acct_example_123456",
+    boundAt: CREATED_AT,
+    expiresAt: "2026-09-12T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function validAffinitySessions() {
+  return {
+    version: 1,
+    epoch: SESSION_EPOCH,
+    bindings: { [ROOT_DIGEST]: boundRecord() },
+    aliases: {
+      [CHILD_DIGEST]: {
+        state: "live",
+        rootDigest: ROOT_DIGEST,
+        createdAt: CREATED_AT,
+        lastUsedAt: CREATED_AT,
+        expiresAt: "2026-09-12T00:00:00.000Z",
+      },
+    },
+    quarantine: null,
+  };
+}
+
+test("legacy v1 pool remains switchable with fallback disabled", () => {
+  const options = fixture();
+  writePool(options, {
+    version: 1,
+    policy: { enabled: true, mode: "switch" },
+    accounts: {},
+    sessions: {},
+  });
+  const state = readChatGPTAccountPoolState(options.filePath);
+  assert.equal(typeof accountPoolModule.normalizeFallbackPolicy, "function");
+  assert.equal(state.policy.fallback.enabled, false);
+  assert.equal(state.explicitSwitchUsable, true);
+});
+
+test("unknown policy and fallback keys fail closed without disabling explicit switching", () => {
+  const options = fixture();
+  writePool(options, {
+    version: 1,
+    policy: {
+      enabled: true,
+      mode: "switch",
+      fallback: {
+        enabled: true,
+        strategy: "strict-priority",
+        maxHops: 2,
+        affinityTtlSeconds: 604800,
+        rogue: true,
+      },
+      futurePolicy: true,
+    },
+    accounts: {},
+    sessions: {},
+  });
+  const state = readChatGPTAccountPoolState(options.filePath);
+  assert.equal(state.policy.fallback.enabled, false);
+  assert.equal(state.explicitSwitchUsable, true);
+});
+
+test("invalid sessions quarantine affinity without invalidating switching", () => {
+  const options = fixture();
+  writePool(options, {
+    version: 1,
+    policy: {
+      enabled: true,
+      mode: "switch",
+      fallback: {
+        enabled: true,
+        strategy: "strict-priority",
+        maxHops: 2,
+        affinityTtlSeconds: 604800,
+      },
+    },
+    accounts: {},
+    sessions: { version: 1, rogue: true },
+  });
+  const state = readChatGPTAccountPoolState(options.filePath);
+  assert.equal(typeof accountPoolModule.normalizeAffinitySessions, "function");
+  assert.equal(state.affinityQuarantine.state, "affinity-secret-invalid");
+  assert.equal(state.explicitSwitchUsable, true);
+
+  const rewritten = writeChatGPTAccountPoolState(state, options.filePath);
+  assert.equal(rewritten.affinityQuarantine.state, "affinity-secret-invalid");
+  assert.equal(readChatGPTAccountPoolState(options.filePath).affinityQuarantine.state, "affinity-secret-invalid");
+});
+
+test("valid discriminated affinity bindings and aliases survive normalization", () => {
+  const sessions = validAffinitySessions();
+  assert.deepEqual(accountPoolModule.normalizeAffinitySessions(sessions), sessions);
+});
+
+test("unknown nested affinity keys quarantine the whole sessions subtree durably", () => {
+  const options = fixture();
+  const sessions = validAffinitySessions();
+  sessions.bindings[ROOT_DIGEST].rogue = true;
+  writePool(options, {
+    version: 1,
+    policy: { enabled: true, mode: "switch" },
+    accounts: {},
+    sessions,
+  });
+
+  const state = readChatGPTAccountPoolState(options.filePath);
+  assert.equal(state.affinityQuarantine.state, "affinity-secret-invalid");
+  const rewritten = writeChatGPTAccountPoolState(state, options.filePath);
+  assert.deepEqual(Object.keys(rewritten.sessions).sort(), [
+    "aliases",
+    "bindings",
+    "epoch",
+    "quarantine",
+    "version",
+  ]);
+  assert.equal(rewritten.sessions.quarantine.state, "affinity-secret-invalid");
+
+  const reread = readChatGPTAccountPoolState(options.filePath);
+  assert.deepEqual(reread.sessions, rewritten.sessions);
+  assert.deepEqual(reread.affinityQuarantine, rewritten.affinityQuarantine);
+});
+
+test("whitespace-wrapped affinity account ids quarantine the whole sessions subtree", () => {
+  const options = fixture();
+  const sessions = validAffinitySessions();
+  sessions.bindings[ROOT_DIGEST].accountId = " acct_example_123456 ";
+  writePool(options, {
+    version: 1,
+    policy: { enabled: true, mode: "switch" },
+    accounts: {},
+    sessions,
+  });
+
+  const state = readChatGPTAccountPoolState(options.filePath);
+  assert.equal(state.affinityQuarantine.state, "affinity-secret-invalid");
+  assert.deepEqual(state.sessions.bindings, {});
+  assert.deepEqual(state.sessions.aliases, {});
+});
+
+test("valid additive policy session and account observations survive pool writes", () => {
+  const options = fixture();
+  const account = createChatGPTSubscriptionAccount(options);
+  const state = readChatGPTAccountPoolState(options.filePath);
+  state.policy.fallback = {
+    enabled: true,
+    strategy: "strict-priority",
+    maxHops: 1,
+    affinityTtlSeconds: 604800,
+  };
+  state.sessions = {
+    version: 1,
+    epoch: "AAAAAAAAAAAAAAAAAAAAAA",
+    bindings: {},
+    aliases: {},
+    quarantine: null,
+  };
+  state.accounts[account.id].fallback = {
+    enabled: true,
+    quota: { state: "clear", observedAt: "2026-09-05T00:00:00.000Z", cooldownUntil: null },
+    catalog: {
+      state: "ready",
+      generation: "generation-a",
+      capturedAt: "2026-09-05T00:00:00.000Z",
+      lastAttemptAt: "2026-09-05T00:00:00.000Z",
+      lastResult: "ok",
+    },
+  };
+
+  const written = writeChatGPTAccountPoolState(state, options.filePath);
+  assert.equal(typeof accountPoolModule.normalizeFallbackObservation, "function");
+  assert.deepEqual(written.policy.fallback, state.policy.fallback);
+  assert.deepEqual(written.sessions, state.sessions);
+  assert.deepEqual(written.accounts[account.id].fallback, state.accounts[account.id].fallback);
+  assert.equal(readChatGPTAccountPoolState(options.filePath).policy.fallback.enabled, true);
+});
+
+test("unknown account fallback observation keys disable only automatic use", () => {
+  const options = fixture();
+  const account = createChatGPTSubscriptionAccount(options);
+  const state = readChatGPTAccountPoolState(options.filePath);
+  state.accounts[account.id].fallback = { enabled: true, rogue: true };
+  const written = writeChatGPTAccountPoolState(state, options.filePath);
+  assert.equal(written.accounts[account.id].fallback.enabled, false);
+  assert.equal(written.accounts[account.id].state, "active");
+  assert.equal(written.explicitSwitchUsable, true);
+});
 
 test("saved accounts use isolated homes and never persist credentials in pool state", () => {
   const options = fixture();
@@ -554,4 +763,69 @@ test("an unreadable account-list path fails closed instead of becoming an empty 
   mkdirSync(options.filePath);
   assert.throws(() => readChatGPTAccountPoolState(options.filePath), /not a regular file/i);
   assert.throws(() => createChatGPTSubscriptionAccount(options), /not a regular file/i);
+});
+
+test("fallback candidates are strict-priority, catalog-gated, and bounded", () => {
+  const options = fixture();
+  const primary = createChatGPTSubscriptionAccount(options);
+  const backup = createChatGPTSubscriptionAccount(options);
+  const state = readChatGPTAccountPoolState(options.filePath);
+  state.policy = {
+    ...state.policy,
+    selectedAccountId: primary.id,
+    fallback: { enabled: true, strategy: "strict-priority", maxHops: 2, affinityTtlSeconds: 604800 },
+  };
+  state.accounts[primary.id] = { ...state.accounts[primary.id], priority: 1 };
+  state.accounts[primary.id].identity = { accountId: "chatgpt-primary" };
+  state.accounts[backup.id] = {
+    ...state.accounts[backup.id],
+    priority: 2,
+    identity: { accountId: "chatgpt-backup" },
+    subscription: { status: "usable" },
+    health: { state: "healthy" },
+    fallback: { enabled: true, quota: { state: "unknown" }, catalog: { state: "ready", generation: "abcdefghijklmnopqrstuv", capturedAt: new Date().toISOString(), lastAttemptAt: new Date().toISOString(), lastResult: "ok" } },
+  };
+  writeChatGPTAccountPoolState(state, options.filePath);
+  assert.deepEqual(
+    eligibleChatGPTFallbackAccounts({ pool: state, primaryAccountId: "chatgpt-primary" }).map((account) => account.id),
+    [backup.id],
+  );
+});
+
+test("fallback candidates require a current catalog observation", () => {
+  const options = fixture();
+  const primary = createChatGPTSubscriptionAccount(options);
+  const backup = createChatGPTSubscriptionAccount(options);
+  const state = readChatGPTAccountPoolState(options.filePath);
+  const now = Date.parse("2026-09-05T12:00:00.000Z");
+  state.policy = {
+    ...state.policy,
+    fallback: { enabled: true, strategy: "strict-priority", maxHops: 2, affinityTtlSeconds: 604800 },
+  };
+  state.accounts[primary.id].identity = { accountId: "chatgpt-primary" };
+  state.accounts[backup.id] = {
+    ...state.accounts[backup.id],
+    priority: 2,
+    identity: { accountId: "chatgpt-backup" },
+    subscription: { status: "usable" },
+    health: { state: "healthy" },
+    fallback: {
+      enabled: true,
+      quota: { state: "clear" },
+      catalog: { state: "ready", generation: "abcdefghijklmnopqrstuv", lastResult: "ok" },
+    },
+  };
+  const candidates = () => eligibleChatGPTFallbackAccounts({
+    pool: state,
+    primaryAccountId: "chatgpt-primary",
+    now,
+  }).map((account) => account.id);
+
+  assert.deepEqual(candidates(), []);
+  state.accounts[backup.id].fallback.catalog.capturedAt = new Date(now - (7 * 24 * 60 * 60 * 1000)).toISOString();
+  assert.deepEqual(candidates(), [backup.id]);
+  state.accounts[backup.id].fallback.catalog.capturedAt = new Date(now - (7 * 24 * 60 * 60 * 1000) - 1).toISOString();
+  assert.deepEqual(candidates(), []);
+  state.accounts[backup.id].fallback.catalog.capturedAt = new Date(now + 1).toISOString();
+  assert.deepEqual(candidates(), []);
 });

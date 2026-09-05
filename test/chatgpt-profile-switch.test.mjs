@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync as rawWriteFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync as rawWriteFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -31,12 +31,14 @@ import {
   selectedChatGPTUsageProfile,
 } from "../src/chatgpt-profile-switch.mjs";
 import { withCatalogPublicationLock } from "../src/catalog-publication-lock.mjs";
+import { withChatGPTAccountOperationLock } from "../src/chatgpt-account-operation-lock.mjs";
 import { privateFileIsProtected, protectPrivateFile } from "../src/file-security.mjs";
 import {
   CHATGPT_LOGIN_LEASE_MAX_AGE_MS,
   clearChatGPTLoginLease,
   createChatGPTLoginLease,
 } from "../src/chatgpt-login-lease.mjs";
+import { createRequestUseLease } from "../src/chatgpt-request-use-lease.mjs";
 
 function writeFileSync(target, contents, options) {
   rawWriteFileSync(target, contents, options);
@@ -61,6 +63,50 @@ function runModuleChild(source) {
     });
   });
 }
+
+test("an active request-use lease blocks profile switching and account removal", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-request-lease-"));
+  const primaryHome = path.join(root, "primary");
+  const homesDir = path.join(root, "accounts");
+  const filePath = path.join(root, "pool.json");
+  const switchPath = path.join(root, "switch.json");
+  mkdirSync(primaryHome, { recursive: true });
+  const first = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const second = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const firstAuth = JSON.stringify({ tokens: { access_token: "first-token", account_id: "first" } });
+  const secondAuth = JSON.stringify({ tokens: { access_token: "second-token", account_id: "second" } });
+  writeFileSync(path.join(primaryHome, "auth.json"), firstAuth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(first.id, { homesDir }), firstAuth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(second.id, { homesDir }), secondAuth, { mode: 0o600 });
+  const identity = () => "request-owner";
+  const lease = await createRequestUseLease({
+    accountId: second.id,
+    affinityGeneration: "abcdefghijklmnopqrstuv",
+    requestStartedWallMs: Date.now(),
+    filePath,
+    homesDir,
+    identity,
+    identityProbe: () => ({ state: "alive", identity: "request-owner" }),
+  });
+  const options = {
+    filePath,
+    homesDir,
+    primaryHome,
+    switchPath,
+    platform: "darwin",
+    processList: "",
+    refreshCatalog: false,
+    requestLeaseIdentityProbe: () => ({ state: "alive", identity: "request-owner" }),
+  };
+  try {
+    await assert.rejects(requestChatGPTProfileSwitch(second.id, options), /active request|in use/i);
+    await assert.rejects(removeChatGPTProfileAccount(second.id, options), /active request|in use/i);
+    assert.equal(readFileSync(path.join(primaryHome, "auth.json"), "utf8"), firstAuth);
+    assert.ok(readChatGPTAccountPoolState(filePath).accounts[second.id]);
+  } finally {
+    assert.equal(await lease.release(), true);
+  }
+});
 
 test("settled account discovery leaves state bytes, mtimes, and absent files unchanged", async () => {
   const emptyRoot = mkdtempSync(path.join(os.tmpdir(), "codex-profile-empty-read-"));
@@ -255,7 +301,7 @@ test("a target auth rewrite during switching rolls back instead of installing an
   });
 });
 
-test("a target auth rewrite during awaited catalog refresh rolls back before commit", async () => {
+test("a target identity rewrite during awaited catalog refresh fails closed with recovery evidence", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-target-refresh-drift-"));
   const primaryHome = path.join(root, "primary");
   const homesDir = path.join(root, "accounts");
@@ -290,17 +336,18 @@ test("a target auth rewrite during awaited catalog refresh rolls back before com
         writeFileSync(targetPath, replacementAuth, { mode: 0o600 });
       },
     }),
-    /selected ChatGPT login profile changed during the native switch/,
+    /transaction capability changed/,
   );
-  assert.equal(readFileSync(path.join(primaryHome, "auth.json"), "utf8"), firstAuth);
+  assert.equal(readFileSync(path.join(primaryHome, "auth.json"), "utf8"), secondAuth);
   assert.equal(readFileSync(targetPath, "utf8"), replacementAuth);
   assert.deepEqual(readChatGPTProfileSwitchState(switchPath), {
     version: 1,
     desired: second.id,
     active: first.id,
     pending: true,
-    phase: "idle",
+    phase: "backed-up",
   });
+  assert.equal(existsSync(path.join(root, "chatgpt-profile", "switch-transaction")), true);
 });
 
 test("private OAuth profile copies protect the temporary and final replacement", () => {
@@ -1450,7 +1497,123 @@ test("a catalog refresh failure restores the previous auth and catalog atomicall
   assert.equal(readChatGPTProfileSwitchState(switchPath).pending, true);
 });
 
-test("a failed profile rollback cannot overwrite a queued catalog publication", async () => {
+test("profile refresh releases operation locks while its durable switch reservation blocks requests", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-unlocked-refresh-"));
+  const primaryHome = path.join(root, "primary");
+  const homesDir = path.join(root, "accounts");
+  const filePath = path.join(root, "pool.json");
+  const switchPath = path.join(root, "switch.json");
+  mkdirSync(primaryHome, { recursive: true });
+  const first = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const second = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const firstAuth = JSON.stringify({ tokens: { access_token: "first", account_id: "first" } });
+  const secondAuth = JSON.stringify({ tokens: { access_token: "second", account_id: "second" } });
+  writeFileSync(path.join(primaryHome, "auth.json"), firstAuth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(first.id, { homesDir }), firstAuth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(second.id, { homesDir }), secondAuth, { mode: 0o600 });
+  let requestBlocked = false;
+  const switched = await requestChatGPTProfileSwitch(second.id, {
+    filePath,
+    homesDir,
+    primaryHome,
+    switchPath,
+    platform: "darwin",
+    processList: "",
+    refreshCatalog: async () => {
+      await assert.rejects(
+        withCatalogPublicationLock(
+          async () => assert.fail("catalog publishing must retain its publication lock"),
+          { stateDir: root, waitMs: 0, retryMs: 10 },
+        ),
+        (error) => error?.code === "catalog_publication_locked",
+      );
+      await withChatGPTAccountOperationLock(second.id, async () => {}, {
+        filePath,
+        homesDir,
+        waitMs: 75,
+        retryMs: 10,
+      });
+      const attempt = await createRequestUseLease({
+        accountId: second.id,
+        affinityGeneration: "abcdefghijklmnopqrstuv",
+        requestStartedWallMs: Date.now(),
+        filePath,
+        homesDir,
+        switchPath,
+        waitMs: 75,
+        retryMs: 10,
+      }).then(async (handle) => {
+        await handle.release();
+        return null;
+      }, (error) => error);
+      requestBlocked = /profile switch|reservation/i.test(attempt?.message || "");
+      await assert.rejects(
+        requestChatGPTProfileSwitch(first.id, {
+          filePath,
+          homesDir,
+          primaryHome,
+          switchPath,
+          platform: "darwin",
+          processList: "",
+          refreshCatalog: false,
+          waitMs: 75,
+          retryMs: 10,
+        }),
+        /writer reservation|profile switch.*active|catalog.*locked|catalog publication/i,
+      );
+    },
+  });
+  assert.equal(requestBlocked, true);
+  assert.equal(switched.active, second.id);
+});
+
+test("success and error resume preserve a replacement switch transaction", async () => {
+  for (const failRefresh of [false, true]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-capability-replacement-"));
+    const primaryHome = path.join(root, "primary");
+    const homesDir = path.join(root, "accounts");
+    const filePath = path.join(root, "pool.json");
+    const switchPath = path.join(root, "switch.json");
+    const transactionDir = path.join(root, "chatgpt-profile", "switch-transaction");
+    const displacedDir = `${transactionDir}.foreign-original`;
+    mkdirSync(primaryHome, { recursive: true });
+    const first = createChatGPTSubscriptionAccount({ filePath, homesDir });
+    const second = createChatGPTSubscriptionAccount({ filePath, homesDir });
+    const firstAuth = JSON.stringify({ tokens: { access_token: "first", account_id: "first" } });
+    const secondAuth = JSON.stringify({ tokens: { access_token: "second", account_id: "second" } });
+    writeFileSync(path.join(primaryHome, "auth.json"), firstAuth, { mode: 0o600 });
+    writeFileSync(chatGPTSubscriptionAccountAuthPath(first.id, { homesDir }), firstAuth, { mode: 0o600 });
+    writeFileSync(chatGPTSubscriptionAccountAuthPath(second.id, { homesDir }), secondAuth, { mode: 0o600 });
+    await assert.rejects(
+      requestChatGPTProfileSwitch(second.id, {
+        filePath,
+        homesDir,
+        primaryHome,
+        switchPath,
+        platform: "darwin",
+        processList: "",
+        refreshCatalog: () => {
+          renameSync(transactionDir, displacedDir);
+          cpSync(displacedDir, transactionDir, { recursive: true });
+          const manifestPath = path.join(transactionDir, "manifest.json");
+          const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+          manifest.writerStartIdentity = `${manifest.writerStartIdentity}-replacement`;
+          writeFileSync(manifestPath, JSON.stringify(manifest), { mode: 0o600 });
+          if (failRefresh) throw new Error("simulated refresh failure after replacement");
+        },
+      }),
+      /transaction capability|reservation changed|replacement|catalog rollback settlement failed/i,
+    );
+    assert.equal(existsSync(transactionDir), true);
+    assert.equal(existsSync(displacedDir), true);
+    assert.match(
+      JSON.parse(readFileSync(path.join(transactionDir, "manifest.json"), "utf8")).writerStartIdentity,
+      /replacement$/,
+    );
+  }
+});
+
+test("failed catalog refresh restores its snapshot before a queued publisher can commit", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-publication-lock-"));
   const primaryHome = path.join(root, "primary");
   const homesDir = path.join(root, "accounts");
@@ -1499,27 +1662,289 @@ test("a failed profile rollback cannot overwrite a queued catalog publication", 
 
   await assert.rejects(
     withCatalogPublicationLock(
-      async () => assert.fail("the profile switch must still own catalog publication"),
+      async () => assert.fail("the catalog publisher must still own publication"),
       { stateDir: root, waitMs: 0, retryMs: 20 },
     ),
     (error) => error?.code === "catalog_publication_locked",
   );
 
+  let releasePoolHolder;
+  let markPoolHeld;
+  const poolHeld = new Promise((resolve) => { markPoolHeld = resolve; });
+  const poolRelease = new Promise((resolve) => { releasePoolHolder = resolve; });
+  const poolHolder = withChatGPTAccountPoolLock(async () => {
+    markPoolHeld();
+    await poolRelease;
+  }, { filePath, waitMs: 5_000, retryMs: 10 });
+  await poolHeld;
+
   let markQueuedPublisherStarted;
   const queuedPublisherStartedLatch = new Promise((resolve) => {
     markQueuedPublisherStarted = resolve;
   });
+  let catalogSeenByQueuedPublisher;
   const queuedPublication = withCatalogPublicationLock(async () => {
     markQueuedPublisherStarted();
+    catalogSeenByQueuedPublisher = JSON.parse(readFileSync(catalog.mergedCatalogPath, "utf8"));
     writeFileSync(catalog.mergedCatalogPath, JSON.stringify({ publisher: "provider" }), { mode: 0o600 });
   }, { stateDir: root, waitMs: 60_000, retryMs: 20 });
 
   releaseRefresh();
-  await assert.rejects(switching, /forced profile publication failure/);
   await queuedPublisherStartedLatch;
   await queuedPublication;
+  releasePoolHolder();
+  await poolHolder;
+  await assert.rejects(switching, /forced profile publication failure/);
+  assert.deepEqual(catalogSeenByQueuedPublisher, { publisher: "before-switch" });
   assert.deepEqual(JSON.parse(readFileSync(catalog.mergedCatalogPath, "utf8")), { publisher: "provider" });
   assert.equal(readFileSync(path.join(primaryHome, "auth.json"), "utf8"), firstAuth);
+});
+
+test("catalog settlement failure retains recovery evidence and never overwrites a queued publisher", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-catalog-settlement-failure-"));
+  const primaryHome = path.join(root, "primary");
+  const homesDir = path.join(root, "accounts");
+  const filePath = path.join(root, "pool.json");
+  const switchPath = path.join(root, "switch.json");
+  const transactionDir = path.join(root, "chatgpt-profile", "switch-transaction");
+  const modelsCachePath = path.join(root, "models_cache.json");
+  mkdirSync(primaryHome, { recursive: true });
+  const first = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const second = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const firstAuth = JSON.stringify({ tokens: { access_token: "first", account_id: "first" } });
+  const secondAuth = JSON.stringify({ tokens: { access_token: "second", account_id: "second" } });
+  writeFileSync(path.join(primaryHome, "auth.json"), firstAuth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(first.id, { homesDir }), firstAuth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(second.id, { homesDir }), secondAuth, { mode: 0o600 });
+  writeFileSync(modelsCachePath, JSON.stringify({ publisher: "before-switch" }), { mode: 0o600 });
+
+  let markRefreshStarted;
+  let releaseRefresh;
+  const refreshStarted = new Promise((resolve) => { markRefreshStarted = resolve; });
+  const refreshRelease = new Promise((resolve) => { releaseRefresh = resolve; });
+  const switching = requestChatGPTProfileSwitch(second.id, {
+    filePath,
+    homesDir,
+    primaryHome,
+    switchPath,
+    modelsCachePath,
+    catalogLockStateDir: root,
+    platform: "darwin",
+    processList: "",
+    refreshCatalog: async () => {
+      writeFileSync(modelsCachePath, JSON.stringify({ publisher: "switch" }), { mode: 0o600 });
+      markRefreshStarted();
+      await refreshRelease;
+      throw new Error("forced catalog refresh failure");
+    },
+    beforeCatalogErrorSettlement() {
+      throw new Error("injected catalog settlement failure");
+    },
+  });
+  const switchingOutcome = switching.then(
+    () => null,
+    (error) => error,
+  );
+  await refreshStarted;
+
+  let releasePoolHolder;
+  let markPoolHeld;
+  const poolHeld = new Promise((resolve) => { markPoolHeld = resolve; });
+  const poolRelease = new Promise((resolve) => { releasePoolHolder = resolve; });
+  const poolHolder = withChatGPTAccountPoolLock(async () => {
+    markPoolHeld();
+    await poolRelease;
+  }, { filePath, waitMs: 5_000, retryMs: 10 });
+  await poolHeld;
+
+  let markPublisherStarted;
+  const publisherStarted = new Promise((resolve) => { markPublisherStarted = resolve; });
+  const queuedPublisher = withCatalogPublicationLock(async () => {
+    markPublisherStarted();
+    writeFileSync(modelsCachePath, JSON.stringify({ publisher: "provider" }), { mode: 0o600 });
+  }, { stateDir: root, waitMs: 60_000, retryMs: 10 });
+
+  releaseRefresh();
+  await publisherStarted;
+  await queuedPublisher;
+  releasePoolHolder();
+  await poolHolder;
+  const switchingError = await switchingOutcome;
+  assert.match(switchingError?.message || "", /catalog rollback settlement failed/i);
+  assert.deepEqual(JSON.parse(readFileSync(modelsCachePath, "utf8")), { publisher: "provider" });
+  assert.equal(existsSync(transactionDir), true);
+  assert.equal(readChatGPTProfileSwitchState(switchPath).phase, "backed-up");
+  assert.equal(readFileSync(path.join(primaryHome, "auth.json"), "utf8"), secondAuth);
+});
+
+test("outer catalog lock acquisition and release failures retain recovery evidence without overwriting a queued publisher", async (t) => {
+  for (const failurePoint of ["acquisition", "release"]) {
+    await t.test(failurePoint, async () => {
+      const root = mkdtempSync(path.join(os.tmpdir(), `codex-profile-outer-catalog-${failurePoint}-`));
+      const primaryHome = path.join(root, "primary");
+      const homesDir = path.join(root, "accounts");
+      const filePath = path.join(root, "pool.json");
+      const switchPath = path.join(root, "switch.json");
+      const transactionDir = path.join(root, "chatgpt-profile", "switch-transaction");
+      const modelsCachePath = path.join(root, "models_cache.json");
+      mkdirSync(primaryHome, { recursive: true });
+      const first = createChatGPTSubscriptionAccount({ filePath, homesDir });
+      const second = createChatGPTSubscriptionAccount({ filePath, homesDir });
+      const firstAuth = JSON.stringify({ tokens: { access_token: "first", account_id: "first" } });
+      const secondAuth = JSON.stringify({ tokens: { access_token: "second", account_id: "second" } });
+      writeFileSync(path.join(primaryHome, "auth.json"), firstAuth, { mode: 0o600 });
+      writeFileSync(chatGPTSubscriptionAccountAuthPath(first.id, { homesDir }), firstAuth, { mode: 0o600 });
+      writeFileSync(chatGPTSubscriptionAccountAuthPath(second.id, { homesDir }), secondAuth, { mode: 0o600 });
+      writeFileSync(modelsCachePath, JSON.stringify({ publisher: "before-switch" }), { mode: 0o600 });
+
+      let catalogLockCalls = 0;
+      let markFailureWindow;
+      let releaseOuterFailure;
+      const failureWindow = new Promise((resolve) => { markFailureWindow = resolve; });
+      const outerFailureRelease = new Promise((resolve) => { releaseOuterFailure = resolve; });
+      const switching = requestChatGPTProfileSwitch(second.id, {
+        filePath,
+        homesDir,
+        primaryHome,
+        switchPath,
+        modelsCachePath,
+        catalogLockStateDir: root,
+        platform: "darwin",
+        processList: "",
+        withProfileCatalogLock: async (operation, lockOptions) => {
+          catalogLockCalls += 1;
+          if (catalogLockCalls !== 2) {
+            return withCatalogPublicationLock(operation, lockOptions);
+          }
+          if (failurePoint === "release") {
+            await withCatalogPublicationLock(operation, lockOptions);
+          }
+          markFailureWindow();
+          await outerFailureRelease;
+          throw new Error(
+            failurePoint === "release"
+              ? "The Codex model catalog was published, but its publication lock could not be released (injected)."
+              : `injected outer catalog lock ${failurePoint} failure`,
+          );
+        },
+        refreshCatalog: async () => {
+          writeFileSync(modelsCachePath, JSON.stringify({ publisher: "switch" }), { mode: 0o600 });
+          if (failurePoint === "acquisition") {
+            throw new Error("fallback refresh failure when acquisition injection is ignored");
+          }
+        },
+      });
+      const switchingOutcome = switching.then(
+        () => null,
+        (error) => error,
+      );
+
+      const firstEvent = await Promise.race([
+        failureWindow.then(() => "failure-window"),
+        switchingOutcome.then(() => "switch-finished"),
+      ]);
+      assert.equal(firstEvent, "failure-window");
+      await withCatalogPublicationLock(
+        async () => {
+          writeFileSync(modelsCachePath, JSON.stringify({ publisher: "provider" }), { mode: 0o600 });
+        },
+        { stateDir: root, waitMs: 5_000, retryMs: 10 },
+      );
+      releaseOuterFailure();
+
+      const switchingError = await switchingOutcome;
+      assert.equal(switchingError?.code, "chatgpt_catalog_settlement_failed");
+      assert.deepEqual(JSON.parse(readFileSync(modelsCachePath, "utf8")), { publisher: "provider" });
+      assert.equal(existsSync(transactionDir), failurePoint !== "release");
+      assert.equal(readChatGPTProfileSwitchState(switchPath).phase, failurePoint === "release" ? "idle" : "backed-up");
+      assert.equal(readFileSync(path.join(primaryHome, "auth.json"), "utf8"), secondAuth);
+      assert.equal(catalogLockCalls, failurePoint === "release" ? 3 : 2);
+    });
+  }
+});
+
+test("profile discovery refuses a live switch writer during unlocked catalog refresh", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-discovery-reservation-"));
+  const primaryHome = path.join(root, "primary");
+  const homesDir = path.join(root, "accounts");
+  const filePath = path.join(root, "pool.json");
+  const switchPath = path.join(root, "switch.json");
+  mkdirSync(primaryHome, { recursive: true });
+  const first = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const second = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const firstAuth = JSON.stringify({ tokens: { access_token: "first", account_id: "first" } });
+  const secondAuth = JSON.stringify({ tokens: { access_token: "second", account_id: "second" } });
+  writeFileSync(path.join(primaryHome, "auth.json"), firstAuth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(first.id, { homesDir }), firstAuth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(second.id, { homesDir }), secondAuth, { mode: 0o600 });
+  const switched = await requestChatGPTProfileSwitch(second.id, {
+    filePath,
+    homesDir,
+    primaryHome,
+    switchPath,
+    platform: "darwin",
+    processList: "",
+    refreshCatalog: async () => {
+      await assert.rejects(
+        ensureChatGPTProfileAccounts({
+          filePath,
+          homesDir,
+          primaryHome,
+          switchPath,
+          waitMs: 75,
+          retryMs: 10,
+        }),
+        /writer reservation|profile switch.*active/i,
+      );
+    },
+  });
+  assert.equal(switched.active, second.id);
+});
+
+test("error resume checks active and target login exclusion before rollback", async () => {
+  for (const leaseSide of ["active", "target"]) {
+    const root = mkdtempSync(path.join(os.tmpdir(), `codex-profile-error-login-${leaseSide}-`));
+    const primaryHome = path.join(root, "primary");
+    const homesDir = path.join(root, "accounts");
+    const filePath = path.join(root, "pool.json");
+    const switchPath = path.join(root, "switch.json");
+    const transactionDir = path.join(root, "chatgpt-profile", "switch-transaction");
+    mkdirSync(primaryHome, { recursive: true });
+    const first = createChatGPTSubscriptionAccount({ filePath, homesDir });
+    const second = createChatGPTSubscriptionAccount({ filePath, homesDir });
+    const firstAuth = JSON.stringify({ tokens: { access_token: "first", account_id: "first" } });
+    const secondAuth = JSON.stringify({ tokens: { access_token: "second", account_id: "second" } });
+    writeFileSync(path.join(primaryHome, "auth.json"), firstAuth, { mode: 0o600 });
+    writeFileSync(chatGPTSubscriptionAccountAuthPath(first.id, { homesDir }), firstAuth, { mode: 0o600 });
+    writeFileSync(chatGPTSubscriptionAccountAuthPath(second.id, { homesDir }), secondAuth, { mode: 0o600 });
+    const leasedAccountId = leaseSide === "active" ? first.id : second.id;
+    let loginLease;
+    try {
+      await assert.rejects(
+        requestChatGPTProfileSwitch(second.id, {
+          filePath,
+          homesDir,
+          primaryHome,
+          switchPath,
+          platform: "darwin",
+          processList: "",
+          refreshCatalog: () => {
+            loginLease = createChatGPTLoginLease(leasedAccountId, process.pid, {
+              homesDir,
+              phase: "reserved",
+            });
+            throw new Error("forced catalog error with login conflict");
+          },
+        }),
+        /browser sign-in|login.*progress/i,
+      );
+      assert.equal(existsSync(transactionDir), true);
+      assert.equal(readChatGPTProfileSwitchState(switchPath).phase, "backed-up");
+      assert.equal(readFileSync(path.join(primaryHome, "auth.json"), "utf8"), secondAuth);
+    } finally {
+      if (loginLease) assert.equal(clearChatGPTLoginLease(leasedAccountId, loginLease, { homesDir }), true);
+    }
+  }
 });
 
 test("concurrent account switches serialize without producing a torn auth file", async () => {
