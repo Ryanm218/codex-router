@@ -1182,9 +1182,7 @@ test("electron boundary does not enable node integration or shell argv", async (
   assert.doesNotMatch(main, /script-src[^;]*'unsafe-inline'/);
   const builder = await readFile(new URL("../apps/control-center/electron-builder.yml", import.meta.url), "utf8");
   assert.match(builder, /extraResources:[\s\S]*icon\.png/);
-  assert.match(builder, /from:\s*\.\.\/\.\.\/src\/spawnable-command\.mjs[\s\S]*to:\s*src\/spawnable-command\.mjs/);
-  assert.match(builder, /from:\s*\.\.\/\.\.\/src\/chatgpt-login-lease\.mjs[\s\S]*to:\s*src\/chatgpt-login-lease\.mjs/);
-  assert.match(builder, /from:\s*\.\.\/\.\.\/src\/path-security\.mjs[\s\S]*to:\s*src\/path-security\.mjs/);
+  assert.match(builder, /from:\s*\.\.\/\.\.\/src\n\s*to:\s*src\n/);
   const packageImport = "file:///tmp/x.app/Contents/Resources/app.asar/electron/ipc.mjs";
   assert.equal(
     new URL("../../src/spawnable-command.mjs", packageImport).pathname,
