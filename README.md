@@ -1401,9 +1401,11 @@ Each account keeps its own native model catalog and routed overlay. Usage is
 read from up to eight saved, usable accounts' isolated `CODEX_HOME`
 directories, prioritizing the selected account and using the weekly
 window when available and the monthly window otherwise. This is an explicit
-switch-only feature: it does not perform automatic quota or round-robin
-routing. See [the account switching guide](docs/CHATGPT-ACCOUNT-MODES.md) for
-the safety and token-refresh details.
+switch by default. On macOS and Linux, an explicit `control chatgpt-account-pool fallback on`
+enables strict-priority quota fallback across up to two enrolled
+backup accounts; it is never round-robin, and Windows remains switch-only. See
+[the account switching guide](docs/CHATGPT-ACCOUNT-MODES.md) for the safety and
+token-refresh details.
 ### Use ChatGPT Web models through Codex Router
 
 Codex Router can use the account-gated browser models exposed by

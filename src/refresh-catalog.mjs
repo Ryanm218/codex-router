@@ -11,6 +11,8 @@ import {
 } from "./login-free-refresh-journal.mjs";
 import { withLoginFreeRefreshLock } from "./login-free-refresh-lock.mjs";
 import { nativeAliasFor, readNativeAliases } from "./native-alias.mjs";
+import { captureChatGPTAccountCatalog } from "./chatgpt-account-catalog.mjs";
+import { readChatGPTAccountPoolState } from "./chatgpt-account-pool.mjs";
 
 function nodeRunner(script, args) {
   return spawnSync(process.execPath, [path.join(SOURCE_ROOT, "src", script), ...args], {
@@ -89,6 +91,8 @@ async function refreshCatalogUnlocked({
   canRefreshInPlace = nativeCatalogCanRefreshInPlace,
   aliases = readNativeAliases,
   aliasFor = nativeAliasFor,
+  readAccountPool = readChatGPTAccountPoolState,
+  captureAccountCatalog = captureChatGPTAccountCatalog,
   journal = {
     begin: beginLoginFreeRefresh,
     clear: clearLoginFreeRefreshJournal,
@@ -126,6 +130,21 @@ async function refreshCatalogUnlocked({
       ? pendingJournal?.canonicalModel || aliases()[status.model] || status.model
       : undefined,
   };
+  const refreshAccountCatalogs = async () => {
+    // Refresh each enrolled account's native catalog while Codex is closed.
+    // The account homes remain isolated, and a failed backup probe is recorded
+    // as not-ready without preventing the primary catalog from publishing.
+    try {
+      const pool = readAccountPool();
+      for (const account of Object.values(pool.accounts || {})) {
+        if (account?.state !== "active" || account.paused === true) continue;
+        await captureAccountCatalog(account.id);
+      }
+    } catch {
+      // The global catalog refresh remains authoritative for existing installs;
+      // account-local observations are fail-closed and retried on the next exit.
+    }
+  };
   let restoreNeeded = false;
   let catalogResult;
   // Signed-in Codex keeps its account cache separate from model_catalog_json.
@@ -135,6 +154,7 @@ async function refreshCatalogUnlocked({
   // requires the journaled transport transition below.
   if (routed && !loginFree && canRefreshInPlace()) {
     catalogResult = checked(run, "catalog.mjs", ["--refresh-native"]);
+    await refreshAccountCatalogs();
     return { catalogOutput: catalogResult.stdout || "" };
   }
   try {
@@ -179,6 +199,7 @@ async function refreshCatalogUnlocked({
     }
     throw error;
   }
+  await refreshAccountCatalogs();
   return { catalogOutput: catalogResult.stdout || "" };
 }
 

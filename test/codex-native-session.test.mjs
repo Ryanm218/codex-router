@@ -30,7 +30,9 @@ const {
   nativeSessionHeaders,
   nativeSessionTokenMatches,
   nativeSessionStatus,
+  readProtectedChatGPTSessionDescriptor,
   setNativeSessionSharingEnabled,
+  snapshotChatGPTRequestAuth,
   tokenExpiryMs,
 } = await import("../src/codex-native-session.mjs");
 const { NATIVE_SESSION_CONSENT_PATH } = await import("../src/paths.mjs");
@@ -64,6 +66,11 @@ test("no session on disk means no fallback rather than an error", () => {
   assert.equal(nativeSessionAvailable(), false);
   assert.equal(nativeSessionHeaders(), undefined);
   assert.equal(nativeSessionStatus().present, false);
+});
+
+test("native session exposes the protected descriptor and snapshot seam", () => {
+  assert.equal(typeof readProtectedChatGPTSessionDescriptor, "function");
+  assert.equal(typeof snapshotChatGPTRequestAuth, "function");
 });
 
 test("a signed-in session stays private until the user authorizes sharing once", () => {

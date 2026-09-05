@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { protectPrivateFile } from "../src/file-security.mjs";
+import { processStartIdentity } from "../src/process-identity.mjs";
 
 function writeFileSync(target, contents, options) {
   rawWriteFileSync(target, contents, options);
@@ -59,6 +60,31 @@ test("account selection persists without replacing another saved login", () => {
   assert.equal(status.accounts[added.id].label, "Secondary");
   assert.equal(status.accounts[added.id].state, "active");
   assert.equal(Object.keys(status.accounts).length, 2);
+
+  const requestLeaseDir = path.join(
+    stateDir,
+    "chatgpt-accounts",
+    added.id,
+    "router-request-leases",
+  );
+  mkdirSync(requestLeaseDir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    path.join(requestLeaseDir, "12345678-1234-4123-8123-123456789abc.json"),
+    JSON.stringify({
+      version: 1,
+      accountId: added.id,
+      pid: process.pid,
+      startIdentity: processStartIdentity(process.pid),
+      nonce: "12345678-1234-4123-8123-123456789abc",
+      affinityGeneration: "abcdefghijklmnopqrstuv",
+      createdAt: new Date().toISOString(),
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+    }),
+    { mode: 0o600 },
+  );
+  const inUseStatus = run("chatgpt-account-pool", "status");
+  assert.equal(inUseStatus.maintenance?.deferred, "request-in-use");
+  rmSync(requestLeaseDir, { recursive: true, force: true });
 
   const primary = Object.keys(status.accounts).find((id) => id !== added.id);
   // Desktop runners queue the selection and headless runners apply it. Build
@@ -141,4 +167,13 @@ test("one production account status poll owns pending profile reconciliation", (
   assert.match(accountPool, /await refreshBoundedChatGPTSubscriptionAccounts\(beforeRefresh\)/);
   assert.match(accountPool, /attentionRequired[\s\S]*?retryable: false[\s\S]*?previous sign-in may still be running/i);
   assert.doesNotMatch(accountPool, /\.map\(\(account\) => refreshChatGPTSubscriptionAccount/);
+});
+
+test("fallback enable permits an idle selected profile and rejects only a pending switch", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  assert.match(
+    source,
+    /value === "on" && \(!profile\.active \|\| profile\.active !== current\.policy\.selectedAccountId \|\| profile\.pending\)/,
+  );
+  assert.doesNotMatch(source, /current\.policy\.selectedAccountId \|\| profile\.desired\)/);
 });

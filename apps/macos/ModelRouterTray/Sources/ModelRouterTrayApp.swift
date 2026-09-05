@@ -1023,6 +1023,7 @@ final class RouterStore: ObservableObject {
   // handle it would clear is still its own.
   private var serviceStopGeneration = 0
   private var hostAppRecheck: Task<Void, Never>?
+  private var catalogRefreshCoordinator: CodexCatalogRefreshCoordinator!
   private var serviceWork: Task<Void, Never>?
   private var serviceIntent: ServiceIntent = .unknown
   private struct PendingToggleOperation {
@@ -1190,6 +1191,15 @@ final class RouterStore: ObservableObject {
     menuBarPresetIcon = resolvedMenuBar.presetIcon
     menuBarCustomIconPath = resolvedMenuBar.customIconPath
     reloadCustomMenuBarIcon()
+    catalogRefreshCoordinator = CodexCatalogRefreshCoordinator { [weak self] in
+      guard let self else { return }
+      do {
+        _ = try await self.runControl(arguments: ["catalog-refresh"])
+        self.message = routerLocalized("Codex model catalog refreshed.")
+      } catch {
+        self.message = routerLocalized("Codex model catalog refresh failed.")
+      }
+    }
   }
 
   var codexActive: Bool {
@@ -1322,6 +1332,10 @@ final class RouterStore: ObservableObject {
   }
 
   private func refreshHostAppRunning() {
+    let codexCount = NSRunningApplication
+      .runningApplications(withBundleIdentifier: "com.openai.codex")
+      .filter { !$0.isTerminated }.count
+    _ = catalogRefreshCoordinator.observeCodexInstanceCount(codexCount)
     let detected = hostAppRunningNow()
     if hostAppRunning != detected { hostAppRunning = detected }
     refreshSurfacesVisible()
@@ -3433,6 +3447,11 @@ final class RouterStore: ObservableObject {
   private func restartCodexApp() async throws {
     let bundleIdentifier = "com.openai.codex"
     let workspace = NSWorkspace.shared
+    // This is an intentional managed restart, not the user's final exit. The
+    // coordinator suppresses the zero-process refresh once; any failure to
+    // complete the relaunch drops the suppression so the real exit is still
+    // observed and refreshed.
+    catalogRefreshCoordinator.armManagedRestartSuppression()
     let runningApplications = NSRunningApplication.runningApplications(
       withBundleIdentifier: bundleIdentifier
     )
@@ -3445,6 +3464,7 @@ final class RouterStore: ObservableObject {
 
     for application in runningApplications where !application.isTerminated {
       guard application.terminate() else {
+        catalogRefreshCoordinator.managedRestartTerminationFailed()
         throw RouterError("Codex did not accept a graceful quit request")
       }
     }
@@ -3455,6 +3475,7 @@ final class RouterStore: ObservableObject {
     }
 
     guard runningApplications.allSatisfy({ $0.isTerminated }) else {
+      catalogRefreshCoordinator.managedRestartTerminationFailed()
       throw RouterError("Codex did not quit in time; restart it manually")
     }
 
@@ -3463,12 +3484,16 @@ final class RouterStore: ObservableObject {
     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
       workspace.openApplication(at: applicationURL, configuration: configuration) { _, error in
         if let error {
+          Task { @MainActor in
+            self.catalogRefreshCoordinator.managedRestartTerminationFailed()
+          }
           continuation.resume(throwing: error)
         } else {
           continuation.resume(returning: ())
         }
       }
     }
+    catalogRefreshCoordinator.managedRestartCompleted()
   }
 
   func applicationTerminationReply() -> NSApplication.TerminateReply {
