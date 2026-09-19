@@ -931,6 +931,8 @@
   `control health` was. `control-health.mjs` remains the contract for the CLI
   and the Control Center. The bounded one-second polls during MLX install,
   runtime update, and vision-bridge pull still shell out and are unchanged.
+- **Grok OAuth chat streams no longer emit Responses `event: error` or empty-choice usage trailers.** LiteLLM translates this listener from Chat Completions to Responses and indexes `choices[0]` on every non-error chunk. A committed-head failure now writes `data: {"error":{message,type,code}}` and closes without `[DONE]`; usage rides on the finish-reason chunk. Direct `/v1/responses` to Codex still uses Responses `event: error`.
+
 - **Grok OAuth 4xx, native-relay 429, and empty-completion prelude no longer
   masquerade as a dead Grok gateway.** The Grok forwarder now preserves upstream
   4xx (402 billing, 400 validation, 429 rate limit) instead of collapsing every
