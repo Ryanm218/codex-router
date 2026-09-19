@@ -47,13 +47,20 @@ import {
 } from "./grok-oauth-turn.mjs";
 import { knownServiceTier } from "./request-diagnostics.mjs";
 import { VERSION } from "./version.mjs";
-import { installStableFetchTransport } from "./fetch-transport.mjs";
+import {
+  grokUpstreamDispatcherOptions,
+  installStableFetchTransport,
+} from "./fetch-transport.mjs";
 import { grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
 
 // This process carries only Grok traffic, so its whole pool outlasts the
 // router's stall guard. Undici's 300s default would otherwise end a long
 // reasoning pause with UND_ERR_BODY_TIMEOUT before the guard could decide.
-installStableFetchTransport({ bodyTimeoutMs: grokTransportIdleTimeoutMs() });
+// Keep-alive is Grok-forwarder-only: Codex turns are 30-60s apart.
+installStableFetchTransport({
+  dispatcherOptions: grokUpstreamDispatcherOptions(),
+  bodyTimeoutMs: grokTransportIdleTimeoutMs(),
+});
 
 // LiteLLM speaks OpenAI Chat Completions to this forwarder. It reuses the
 // official Grok CLI OAuth session and translates to xAI's Responses proxy.
@@ -445,11 +452,19 @@ export function toResponsesRequest(chat, options = {}) {
 // never rewrites them, so hashing the first two pins every turn of a session to
 // one server while keeping separate sessions apart. Formatted as a UUID because
 // that is what the header carries everywhere else.
+//
+// Native Grok also keeps one `x-grok-agent-id` per session and increments
+// `x-grok-turn-idx`. A fresh agent id plus turn 1 on every Codex request made
+// each hop look like a new agent start even when conv-id already pinned the
+// KV cache. Agent id is a second hash of the same opening so it is stable and
+// distinct from conv-id. Turn index is 1 plus prior assistant messages, so a
+// tool-follow-up is turn 2 and a progress-only repair (extra user nudge, no
+// new assistant) stays on the same index.
 export function conversationIdForTest(messages) {
-  return conversationId(messages);
+  return grokConversationIdentity(messages).conversationId;
 }
 
-function conversationId(messages) {
+function conversationAnchor(messages) {
   const anchor = [];
   for (const message of Array.isArray(messages) ? messages : []) {
     const content =
@@ -457,8 +472,11 @@ function conversationId(messages) {
     anchor.push(`${message?.role}:${content}`);
     if (anchor.length === 2) break;
   }
-  if (anchor.length === 0) return randomUUID();
-  const digest = createHash("sha256").update(anchor.join("\n")).digest("hex");
+  return anchor.length ? anchor.join("\n") : "";
+}
+
+function uuidFromMaterial(material) {
+  const digest = createHash("sha256").update(material).digest("hex");
   return [
     digest.slice(0, 8),
     digest.slice(8, 12),
@@ -468,8 +486,29 @@ function conversationId(messages) {
   ].join("-");
 }
 
-function upstreamHeaders(accessToken, model, messages, requestId = randomUUID()) {
-  const sessionId = conversationId(messages);
+export function grokConversationIdentity(messages) {
+  const anchor = conversationAnchor(messages);
+  let assistantTurns = 0;
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (message?.role === "assistant") assistantTurns += 1;
+  }
+  return {
+    conversationId: anchor ? uuidFromMaterial(anchor) : randomUUID(),
+    agentId: anchor ? uuidFromMaterial(`grok-agent\n${anchor}`) : randomUUID(),
+    turnIndex: String(assistantTurns + 1),
+  };
+}
+
+export function shouldPrewarmGrokUpstream(baseUrl) {
+  try {
+    return new URL(baseUrl).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function upstreamHeaders(accessToken, model, identity, requestId = randomUUID()) {
+  const sessionId = identity.conversationId;
   return {
     Authorization: `Bearer ${accessToken}`,
     "Content-Type": "application/json",
@@ -483,8 +522,8 @@ function upstreamHeaders(accessToken, model, messages, requestId = randomUUID())
     "x-grok-req-id": requestId,
     "x-grok-model-override": model,
     "x-grok-session-id": sessionId,
-    "x-grok-agent-id": randomUUID(),
-    "x-grok-turn-idx": "1",
+    "x-grok-agent-id": identity.agentId,
+    "x-grok-turn-idx": identity.turnIndex,
     "User-Agent": grokUserAgent(),
   };
 }
@@ -504,6 +543,12 @@ function upstreamAttemptTiming(label, attempt, endedAt = Date.now()) {
 function logUpstreamPhaseFailure(label, model, attempt, error) {
   console.error(
     `[grok-oauth] upstream-phase-failed=true phase=${label} model=${model} ${upstreamAttemptTiming(label, attempt)} error=${error?.name || "Error"}`,
+  );
+}
+
+function logUpstreamPhase(label, model, status, attempt) {
+  console.error(
+    `[grok-oauth] upstream-phase=${label} model=${model} status=${status} ${upstreamAttemptTiming(label, attempt)}`,
   );
 }
 
@@ -582,7 +627,8 @@ async function handleChatCompletions(request, response) {
   const mayRetry =
     PROGRESS_ONLY_RETRY && (afterToolResult || requestOffersClientTools(chat));
   const strictAfterToolRepair = PROGRESS_ONLY_RETRY && afterToolResult;
-  const conversationKey = conversationId(chat?.messages);
+  const identity = grokConversationIdentity(chat?.messages);
+  const conversationKey = identity.conversationId;
   // Attempt 1 normally stays live. Once this exact conversation has actually
   // produced a progress-only stop, buffer only its next short visible prefix.
   // That prevents an aborted/retried turn from committing the same status
@@ -606,7 +652,7 @@ async function handleChatCompletions(request, response) {
     try {
       attempt.response = await fetch(`${GROK_BASE}/responses`, {
         method: "POST",
-        headers: upstreamHeaders(accessToken, model, chat?.messages, attempt.requestId),
+        headers: upstreamHeaders(accessToken, model, identity, attempt.requestId),
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -664,6 +710,8 @@ async function handleChatCompletions(request, response) {
   }
 
   if (!upstream.ok || !upstream.body) {
+    firstAttempt.endedAt = Date.now();
+    logUpstreamPhase("attempt", model, upstream.status, firstAttempt);
     const detail = await upstream.text().catch(() => "");
     const status = grokForwarderClientStatus(upstream.status);
     writeJson(response, status, {
@@ -779,6 +827,7 @@ async function handleChatCompletions(request, response) {
       emitPendingDeltas();
     });
     firstAttempt.endedAt = Date.now();
+    logUpstreamPhase("attempt", model, upstream.status, firstAttempt);
   } catch (error) {
     firstAttempt.endedAt = Date.now();
     logUpstreamPhaseFailure("attempt", model, firstAttempt, error);
@@ -1068,6 +1117,20 @@ if (isMain) {
   reportListenFailure(server, { label: "grok-oauth", host: LISTEN_HOST, port: LISTEN_PORT });
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
     console.error("[grok-oauth] listening");
+    if (!shouldPrewarmGrokUpstream(GROK_BASE)) return;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2_000);
+    fetch(`${GROK_BASE}/responses`, { method: "GET", signal: controller.signal })
+      .then(async (response) => {
+        await response.arrayBuffer().catch(() => {});
+        console.error("[grok-oauth] sampler-prewarm=ok");
+      })
+      .catch((error) => {
+        console.error(
+          `[grok-oauth] sampler-prewarm=failed error=${error?.name || "Error"}`,
+        );
+      })
+      .finally(() => clearTimeout(timer));
   });
 
   installGracefulShutdown(server, { label: "grok-oauth" });

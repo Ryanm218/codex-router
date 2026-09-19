@@ -9,8 +9,10 @@ import { fileURLToPath } from "node:url";
 import { openPort } from "./port-pool.mjs";
 
 import {
+  grokConversationIdentity,
   hostedSearchEnabledFor,
   mergeHostedSearchTools,
+  shouldPrewarmGrokUpstream,
   toResponsesRequest,
 } from "../src/grok-oauth-forwarder.mjs";
 import {
@@ -809,6 +811,39 @@ test("toResponsesRequest preserves the client's image detail level", () => {
   assert.equal("detail" in images[1], false);
 });
 
+test("conversation identity pins agent-id and increments turn-idx from the opening", () => {
+  const opening = [
+    { role: "system", content: "You are Codex." },
+    { role: "user", content: "run the thing" },
+  ];
+  const first = grokConversationIdentity(opening);
+  const second = grokConversationIdentity([
+    ...opening,
+    { role: "assistant", content: "calling", tool_calls: [{ id: "c1", function: { name: "sh" } }] },
+    { role: "tool", tool_call_id: "c1", content: "ok" },
+    { role: "user", content: "and again" },
+  ]);
+  const other = grokConversationIdentity([
+    { role: "system", content: "You are Codex." },
+    { role: "user", content: "other" },
+  ]);
+
+  assert.equal(first.conversationId, second.conversationId);
+  assert.equal(first.agentId, second.agentId);
+  assert.notEqual(first.agentId, first.conversationId);
+  assert.equal(first.turnIndex, "1");
+  assert.equal(second.turnIndex, "2");
+  assert.notEqual(other.conversationId, first.conversationId);
+  assert.notEqual(other.agentId, first.agentId);
+  assert.match(first.agentId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+});
+
+test("sampler prewarm only dials the real https Grok proxy", () => {
+  assert.equal(shouldPrewarmGrokUpstream("https://cli-chat-proxy.grok.com/v1"), true);
+  assert.equal(shouldPrewarmGrokUpstream("http://127.0.0.1:9/v1"), false);
+  assert.equal(shouldPrewarmGrokUpstream("not a url"), false);
+});
+
 // xAI routes by `x-grok-conv-id` so a conversation stays on the server holding
 // its KV cache. A fresh id per request scatters the turns and the cache is
 // never read: measured at 3.9% cached across an append-only session, against
@@ -834,6 +869,70 @@ test("upstream headers keep one conversation on one conv-id", async () => {
     conversationIdForTest([{ role: "system", content: "You are Codex." }, { role: "user", content: "other" }]),
     turnOne,
   );
+});
+
+test("upstream headers reuse agent-id and increment turn-idx on the follow-up turn", async () => {
+  const capturedHeaders = [];
+  const backend = await mockBackend(async (req, res) => {
+    capturedHeaders.push(req.headers);
+    for await (const _chunk of req) {
+      // Drain the POST body so the forwarder can finish.
+    }
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.end(
+      sse([
+        { type: "response.output_text.delta", delta: "ok" },
+        { type: "response.completed", response: { usage: { input_tokens: 4, output_tokens: 1 } } },
+      ]),
+    );
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-identity-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  const base = `http://127.0.0.1:${port}`;
+  const opening = [
+    { role: "system", content: "You are Codex." },
+    { role: "user", content: "run the thing" },
+  ];
+  try {
+    await waitHealth(base, child);
+    const first = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ model: "grok-4.6", messages: opening, stream: false }),
+    });
+    assert.equal(first.status, 200);
+    await first.json();
+    const second = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        model: "grok-4.6",
+        messages: [
+          ...opening,
+          { role: "assistant", content: "calling" },
+          { role: "user", content: "continue" },
+        ],
+        stream: false,
+      }),
+    });
+    assert.equal(second.status, 200);
+    await second.json();
+    assert.equal(capturedHeaders.length, 2);
+    assert.equal(capturedHeaders[0]["x-grok-turn-idx"], "1");
+    assert.equal(capturedHeaders[1]["x-grok-turn-idx"], "2");
+    assert.equal(capturedHeaders[0]["x-grok-conv-id"], capturedHeaders[1]["x-grok-conv-id"]);
+    assert.equal(capturedHeaders[0]["x-grok-agent-id"], capturedHeaders[1]["x-grok-agent-id"]);
+    assert.notEqual(capturedHeaders[0]["x-grok-agent-id"], capturedHeaders[0]["x-grok-conv-id"]);
+    assert.match(
+      child.testErrors(),
+      /\[grok-oauth\] upstream-phase=attempt model=grok-4.6 status=200 .*attempt_headers_ms=\d+/,
+    );
+  } finally {
+    await stop(child);
+    backend.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("streams visible output before the upstream turn completes", async () => {

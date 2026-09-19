@@ -10,6 +10,7 @@ import {
   directLoopbackFetch,
   createLoopbackProbeDispatcher,
   fetchDispatcherOptions,
+  grokUpstreamDispatcherOptions,
   installStableFetchTransport,
   longIdleStreamDispatcher,
   longIdleStreamFetch,
@@ -162,6 +163,25 @@ test("the long-idle fetch honors the same bound for response headers", async () 
 // that surfaces as UND_ERR_SOCKET, and Undici will not retry it -- so the
 // process-wide pool keeps Undici's own 4s default and only the loopback
 // probe pool, which talks to our own server, raises it.
+test("the Grok OAuth forwarder holds idle sockets for 60s without enabling HTTP/2", () => {
+  const options = grokUpstreamDispatcherOptions({});
+  assert.equal(options.allowH2, false);
+  assert.equal(options.pipelining, 1);
+  assert.equal(options.keepAliveTimeout, 60_000);
+  assert.equal("connections" in options, false);
+
+  const custom = grokUpstreamDispatcherOptions({
+    CODEX_ROUTER_GROK_UPSTREAM_KEEPALIVE_MS: "90000",
+  });
+  assert.equal(custom.keepAliveTimeout, 90_000);
+  assert.equal(custom.allowH2, false);
+});
+
+test("the Grok OAuth forwarder installs its longer-lived dispatcher, not the shared 4s pool", () => {
+  const source = readFileSync(path.join(SRC_DIR, "grok-oauth-forwarder.mjs"), "utf8");
+  assert.match(source, /installStableFetchTransport\(\{\s*dispatcherOptions: grokUpstreamDispatcherOptions\(\)/);
+});
+
 test("the process-wide pool does not hold idle sockets past the undici default", () => {
   const { created } = installFakeTransport({});
 
@@ -322,7 +342,7 @@ test("every long-lived server process installs the stable transport", () => {
   for (const name of serverEntryPoints) {
     const source = readFileSync(path.join(SRC_DIR, name), "utf8");
     // A process may pass options (the Grok forwarder raises its body idle
-    // bound), but it must still install the transport.
+    // bound and keep-alive), but it must still install the transport.
     assert.match(
       source,
       /installStableFetchTransport\((?:\{[\s\S]*?\})?\);/,
