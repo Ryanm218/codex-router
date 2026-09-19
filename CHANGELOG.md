@@ -1,6 +1,15 @@
 # Changelog
 
 ## Unreleased
+- **Grok now sees `id` first on flattened tool schemas, so `automation_update`
+  fills the identifier without being told.** Codex's live view branch declares
+  `mode` then `id`. The union flatten used to keep that order, and Grok emits
+  object keys in schema order, so view/update/delete calls arrived with `mode`
+  first. `objectRootToolSchema` now leads with `id` when the field exists, on
+  both merged unions and already-object-rooted copies. `id` stays optional
+  (create omits it). Schemas with no `id`, or with `id` already first, stay by
+  identity.
+
 
 - **Tok/s meter now excludes reasoning tokens and hides during generation.**
   `observedTokensPerSecond` used full `outputTokens` while TTFT waited for the
