@@ -4,6 +4,7 @@ import path from "node:path";
 import { writePrivateJson } from "./file-security.mjs";
 import { STATE_DIR } from "./paths.mjs";
 import { upstreamFailureKind } from "./error-translation.mjs";
+import { isLocalToolArgumentConversionFailure } from "./invalid-function-call.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
 import { cooldownScope } from "./provider-cooldown.mjs";
 import { canonicalProviderId } from "./provider-selection.mjs";
@@ -82,12 +83,18 @@ function isoOrUndefined(value) {
 // request all produce the same answer from every other provider too, so a swap
 // would spend two more round trips to reprint the same failure with a different
 // model's name on it -- and for a credential in particular it would hide the one
-// fact the operator needs. A 5xx is excluded because upstream-retry.mjs already
-// absorbs the transient shapes and because masking a provider outage costs the
-// operator an incident they would want to see.
+// fact the operator needs. A generic 5xx is excluded because the routed turn
+// path retries only the forwarder's reserved pre-response transport marker;
+// masking any other provider outage costs the operator an incident they would
+// want to see.
 export function classifyRoutedFailure({ status, bodyText, retryAfterSeconds, now } = {}) {
   const code = Number(status);
   if (!Number.isFinite(code) || code < 400) return { swap: false };
+  // A LiteLLM Anthropic-conversion parse of stored tool arguments is a local
+  // request failure. The argument body is echoed in the error and can match a
+  // quota phrase, which would otherwise swap the turn onto another provider
+  // for a request that cannot succeed (#796).
+  if (isLocalToolArgumentConversionFailure(bodyText)) return { swap: false };
   // The local provider forwarder writes this reserved marker only before it
   // has committed a response. A generic provider 5xx remains an application
   // failure and is never switched away silently.
@@ -401,10 +408,16 @@ function eligible(
     requiredSearchMode,
     hasSearchHistory,
     cooled,
+    allowSameFamily,
   },
 ) {
   if (!model?.slug) return false;
-  if (canonicalProviderId(model.provider) === fromProvider) return false;
+  // Compact overflow is the one caller that may hop inside a family: a
+  // 262k Go Messages card and a 1M Go Chat sibling share a credential, so
+  // quota failover must still skip them, but a prompt the 262k card cannot
+  // hold is not evidence the 1M sibling cannot. Same-slug is already
+  // filtered by the ranking. Ordinary turns keep the default.
+  if (!allowSameFamily && canonicalProviderId(model.provider) === fromProvider) return false;
   if (cooled.has(cooldownScope(model.provider))) return false;
   if (Number.isFinite(estimatedTokens) && Number(model.contextWindow) < estimatedTokens) {
     return false;
@@ -449,6 +462,7 @@ export function rankFailoverCandidates(
     requiredSearchMode: requiredSearchModeOverride,
     chain = [],
     now,
+    allowSameFamily = false,
   } = options;
   const fromProvider = canonicalProviderId(from?.provider || "");
   // An explicitly captured absence is part of the request contract. `??`
@@ -462,7 +476,6 @@ export function rankFailoverCandidates(
   const cooled = new Set(Object.keys(readProviderCooldowns({ now })));
   const available = (Array.isArray(models) ? models : []).filter(
     (model) =>
-      PROVIDERS.get(model.provider)?.directResponses !== true &&
       model.slug !== from?.slug &&
       eligible(model, {
         fromProvider,
@@ -472,6 +485,7 @@ export function rankFailoverCandidates(
         requiredSearchMode,
         hasSearchHistory,
         cooled,
+        allowSameFamily,
       }),
   );
 

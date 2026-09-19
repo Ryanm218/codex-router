@@ -40,8 +40,18 @@ menu-bar app to show it. It is a movable Codex Router panel rather than an item
 in macOS's **Edit Widgets** gallery.
 
 macOS does not have a public `.dmg` yet; the command above builds and installs
-the app locally. If it asks for the Xcode Command Line Tools, run
-`xcode-select --install` and repeat the command.
+the app locally. That build requires the full Xcode app, not only the standalone
+Command Line Tools, because it contains SwiftUI macro and WidgetKit targets. The
+installer honors `DEVELOPER_DIR` or the Xcode selected under **Xcode → Settings
+→ Locations → Command Line Tools**. If that selection still points at the
+standalone tools, it uses `/Applications/Xcode.app` or
+`/Applications/Xcode-beta.app` for this build only without changing the global
+selection. For an Xcode app in another location, retry the companion with:
+
+```sh
+env DEVELOPER_DIR="/path/to/Xcode.app/Contents/Developer" \
+  ~/.local/share/codex-router/bin/model-router-tray
+```
 
 ## What Codex Router does
 
@@ -252,6 +262,7 @@ Linux installations support the Codex CLI.
 | Kimi K3 (China API) | `kimi-api-cn/kimi-k3` | Separately billed Moonshot **China** platform key |
 | DeepSeek V4 Flash (API) | `deepseek/deepseek-v4-flash` | DeepSeek API key |
 | DeepSeek V4 Pro (API) | `deepseek/deepseek-v4-pro` | DeepSeek API key |
+| DeepSeek V4.1 Flash (API) | `deepseek/deepseek-v4.1-flash` | DeepSeek API key |
 | Grok 4.5 (OAuth) | `grok-oauth/grok-4.5` | Official Grok CLI OAuth session |
 | Grok 4.5 (API) | `grok-api/grok-4.5` | Separately billed xAI API key |
 | Claude Opus 4.8 (API) | `anthropic-api/claude-opus-4.8` | Separately billed Anthropic API key |
@@ -274,6 +285,7 @@ Linux installations support the Codex CLI.
 | DeepSeek V4 Pro (Qwen Plan) | `qwen-plan/deepseek-v4-pro` | Alibaba Model Studio plan API key |
 | DeepSeek V4 Flash (Qwen Plan) | `qwen-plan/deepseek-v4-flash-0731` | Alibaba Model Studio plan API key |
 | GLM-5.2 (Qwen Plan) | `qwen-plan/glm-5.2` | Alibaba Model Studio plan API key |
+| GLM-5.3-Flash (Coding Plan) | `zai-coding/glm-5.3-flash` | Z.ai GLM Coding Plan API key |
 | GLM-5.3 (Coding Plan) | `zai-coding/glm-5.3` | Z.ai GLM Coding Plan API key |
 | GLM-5.2 (Coding Plan) | `zai-coding/glm-5.2` | Z.ai GLM Coding Plan API key |
 | GLM-5-Turbo (Coding Plan) | `zai-coding/glm-5-turbo` | Z.ai GLM Coding Plan API key |
@@ -289,9 +301,12 @@ Linux installations support the Codex CLI.
 | Hy4 Preview (NanoGPT) | `nano-gpt/tencent/hy4-preview` | NanoGPT API key |
 | Hy4 Preview (Nous Research) | `nousresearch/tencent/hy4-preview` | Nous Portal API key |
 | Hy4 Preview (opencode Go) | `opencode-go/hy4-preview` | opencode Go/Zen API key |
+| Union Alpha (opencode Go) | `opencode-go-messages/union-alpha` | opencode Go/Zen API key |
+| Union Alpha (OpenRouter) | `openrouter/union-alpha` | OpenRouter API key |
 | Hy4 Preview (OpenRouter) | `openrouter/tencent/hy4-preview` | OpenRouter API key |
 | GLM-5.2 (ClinePass) | `clinepass/glm-5.2` | ClinePass API key |
 | Kimi K3 (ClinePass) | `clinepass/kimi-k3` | ClinePass API key |
+| Kimi K3 (ainetcafe) | `ainetcafe/kimi-k3` | ainetcafe API key (`AINETCAFE_API_KEY`) |
 | Kimi K2.7 Code (ClinePass) | `clinepass/kimi-k2.7-code` | ClinePass API key |
 | Kimi K2.6 (ClinePass) | `clinepass/kimi-k2.6` | ClinePass API key |
 | DeepSeek V4 Pro (ClinePass) | `clinepass/deepseek-v4-pro` | ClinePass API key |
@@ -585,6 +600,15 @@ forced choice for that model only (`--request-profile auto-tool-choice` in the
 ./bin/curate-models PROVIDER --models MODEL_ID --request-profile auto-tool-choice
 ```
 
+Vertex also has an explicit offline mode for accounts where Model Garden's
+publisher-model list is unavailable: `./bin/curate-models vertex --static --models MODEL_ID`.
+This uses only the reviewed entries in
+`config/vertex/support-catalog.json`, never silently falls back after a live
+discovery failure, and still requires working ADC, Vertex API enablement, IAM,
+and model access when a request is sent. `--static` cannot be combined with
+`--refresh`; it is a curation escape hatch, not proof that the account can use
+every reviewed model.
+
 For an already-curated model, edit only that entry's `requestProfile` in the
 protected `user-models.json`, preserving its existing context, modalities,
 efforts, and other hand-tuned metadata; do not remove and re-add it or apply a
@@ -690,10 +714,12 @@ the operator explicitly selects them.
 | DeepSeek V4 Pro (opencode Go) | `opencode-go/deepseek-v4-pro` |
 | DeepSeek V4 Flash (opencode Go) | `opencode-go/deepseek-v4-flash` |
 | DeepSeek V4 Flash Vision Exp (opencode Go) | `opencode-go/deepseek-v4-flash-vision-exp` |
+| DeepSeek V4.1 Flash (opencode Go) | `opencode-go/deepseek-v4.1-flash` |
 | MiMo-V2.5 (opencode Go) | `opencode-go/mimo-v2.5` |
 | MiMo-V2.5-Pro (opencode Go) | `opencode-go/mimo-v2.5-pro` |
 | Hy3 (opencode Go) | `opencode-go/hy3` |
 | Hy4 Preview (opencode Go) | `opencode-go/hy4-preview` |
+| Union Alpha (opencode Go) | `opencode-go-messages/union-alpha` |
 | MiniMax M3 (opencode Go) | `opencode-go-messages/minimax-m3` |
 | MiniMax M2.7 (opencode Go) | `opencode-go-messages/minimax-m2.7` |
 | MiniMax M2.5 (opencode Go) | `opencode-go-messages/minimax-m2.5` |
@@ -858,6 +884,7 @@ preserves Command Code's reported cached-token usage.
 | --- | --- |
 | DeepSeek V4 Flash (Command Code) | `commandcode/deepseek-v4-flash` |
 | DeepSeek V4 Pro (Command Code) | `commandcode/deepseek-v4-pro` |
+| DeepSeek V4.1 Flash (Command Code) | `commandcode/deepseek-v4.1-flash` |
 | GLM-5.2 (Command Code) | `commandcode/glm-5.2` |
 | Kimi K3 (Command Code) | `commandcode/kimi-k3` |
 | Kimi K2.7 Code (Command Code) | `commandcode/kimi-k2.7-code` |
@@ -905,6 +932,7 @@ Coding, and the Z.ai API route is shipped with the same direct-proven ladder.
 | ~~Ox Alpha (Venice)~~ | `venice/ox-alpha` | ~~Venice~~ | Not shipped — wire verification was billing-blocked |
 | ~~Ox Alpha (OpenCode Free)~~ | `opencode-free/ox-alpha` | ~~no~~ | Withdrawn |
 | GLM-5.3-Flash (opencode Go) | `opencode-go/glm-5.3-flash` | opencode | Named replacement |
+| GLM-5.3-Flash (Command Code) | `commandcode/glm-5.3-flash` | Command Code | Available — catalog-pinned, no exact-route run recorded |
 | GLM-5.3-Flash (OpenRouter) | `openrouter/glm-5.3-flash` | OpenRouter | Available |
 | GLM-5.3-Flash (Z.ai API) | `zai-api/glm-5.3-flash` | Z.ai API | Available |
 | GLM-5.3-Flash (Z.ai Coding) | `zai-coding/glm-5.3-flash` | Z.ai Coding | Available |
@@ -934,11 +962,30 @@ curated `opencode-go/ox-alpha-free` selections migrate to
 `opencode-go/glm-5.3-flash` automatically.
 
 The picker retains OpenCode Go's advertised 1M context, but Codex compacts this
-route at 400K. In live multimodal tasks, larger Flash histories repeatedly
-returned empty completions before the advertised limit; the conservative
-threshold avoids presenting those blank turns as usable context. OpenCode Go's
+route — and every other GLM-5.3-Flash route, whichever provider serves it — at
+400K. In live multimodal tasks, larger Flash histories repeatedly returned
+empty completions before the advertised limit; the conservative threshold
+avoids presenting those blank turns as usable context. OpenCode Go's
 content moderation still applies to the compaction request itself, so a
 sensitive transcript may be rejected even when the ordinary task turn worked.
+
+OpenCode Go's current stealth preview is **Union Alpha** (`union-alpha` on
+the Messages API). It is a separate model from Ox Alpha / GLM-5.3-Flash:
+OpenCode does not name the maker, documents a 262,144-token window with
+131,072 tokens of advertised output, text and image input, and currently
+lists it as free for a limited time. The Messages hop and the published
+catalog reserve the measured 32,768 completion cap. A single message whose
+content exceeds Console Go's 2,500,000-character limit (a generated ImageGen
+PNG data URL) is replaced with a labeled stub so the follow-up turn can
+finish. The shipped slug is
+`opencode-go-messages/union-alpha`. OpenRouter publishes the same preview as
+`stealth/union-alpha` (text and image input, 262,144 context, 131,072 output,
+currently free); the shipped slug is `openrouter/union-alpha`. OpenRouter's
+endpoint record accepts `tool_choice` auto only, so that route downgrades
+Codex's forced choice. It does not advertise a reasoning-effort ladder.
+ClinePass and Command Code do not list this id. Omen Alpha remains in the
+live Go catalog but is deprecated in OpenCode's models.dev record and is not
+checked in.
 
 Command Code and Venice still expose their live catalogs to explicit curation.
 An operator with an entitled account can inspect and select whatever those
@@ -997,6 +1044,13 @@ often for the repository to pin and live-verify individual entries:
 login`, the Control Center and `./bin/curate-models devin-cli` read the model
 configuration available to that account through the installed Devin CLI; the
 provider still ships no preselected models.
+
+`vertex` is the Google Cloud exception. It uses Application Default Credentials
+from `gcloud auth application-default login` plus
+`./bin/control vertex set PROJECT_ID LOCATION`, not an API key, and it is
+never selected by a default install. After connecting, run
+`./bin/curate-models vertex`. A discovered Model Garden id is not routable
+until it is curated onto a reviewed adapter.
 
 OpenRouter, NanoGPT, Venice, and Nous Research are ordinary API-key providers with
 live-reviewed checked-in routes in the model table. Use `bin/curate-models` for
@@ -1342,6 +1396,22 @@ When the Codex runtime is executing inside WSL, a Windows-style path such as
 If setup appears successful but the Desktop model picker does not change, check
 which Codex home was modified before rerunning setup.
 
+### Use external models while signed in to ChatGPT
+
+The Control Center's **Use Router with ChatGPT** switch keeps ChatGPT
+authentication available while external provider models remain selectable. On
+current Codex builds, an explicit switch from the built-in OpenAI provider
+selects the managed `codex-router-signed` transport so Codex validates prefixed
+model ids against the router before sending them. The prior provider is stored
+in protected state and restored when the switch is turned off. Normal updates
+and catalog refreshes do not silently opt an existing installation into this
+provider switch.
+
+The optional native redirect is independent of this switch and of model
+failover. If native redirect is set, every unmatched native GPT turn that
+reaches the router continues to use its configured external route until
+`./bin/control native-redirect clear` is run.
+
 ### Use Codex without an OpenAI login
 
 The tray's **Use without OpenAI login** switch selects the managed custom
@@ -1394,49 +1464,6 @@ window when available and the monthly window otherwise. This is an explicit
 switch-only feature: it does not perform automatic quota or round-robin
 routing. See [the account switching guide](docs/CHATGPT-ACCOUNT-MODES.md) for
 the safety and token-refresh details.
-### Use ChatGPT Web models through Codex Router
-
-Codex Router can use the account-gated browser models exposed by
-[codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) without letting
-the two projects compete for Codex's `openai_base_url`. The browser launcher
-owns its private Electron profile, ChatGPT sign-in, browser automation, and
-optional MCP tunnel. Codex Router remains the only owner of Codex routing,
-provider selection, model publication, usage records, and the background router
-plane.
-
-Install and open the upstream launcher, sign in inside its embedded browser,
-and pass its browser smoke test. **Do not press its Install models action**:
-that action points Codex directly at port 17841 and replaces the router's
-managed base URL. Leave the launcher running, then enable and curate the live,
-account-specific rows through this repository:
-
-```sh
-./bin/model-router codex providers enable chatgpt-web
-./bin/curate-models chatgpt-web --refresh
-```
-
-Curation reads the launcher's loopback `/v1/models` catalog, discards every
-native GPT row, and offers only the `chatgpt-web/*` models the signed-in account
-currently exposes. A chosen route keeps its fixed ChatGPT effort and advertised
-context/image metadata. The request path goes directly from the router to the
-loopback bridge so Codex's native tool, collaboration, image, and compaction
-envelope is not translated by LiteLLM. The user's Codex/ChatGPT bearer token is
-never sent to the launcher; the local hop receives only a non-secret placeholder.
-
-Browser-only mode works with no additional router credential. For the full
-Codex harness, finish the upstream launcher's MCP/tunnel setup and permissions;
-the router does not read or store that tunnel key. Browser/UI drift and
-account-gated model refusals are relayed exactly and are never retried or failed
-over to another provider, and the route is never recruited as another model's
-vision helper, because any of those actions could duplicate a browser turn.
-
-This provider is deliberately Codex-only and is not published into DeepSeek
-Harness or Gemini CLI. Its endpoint defaults to
-`http://127.0.0.1:17841/v1`; `MODEL_ROUTER_CHATGPT_WEB_BASE_URL` may change the
-port but a non-loopback override is refused. The upstream project is unofficial
-browser automation, so its own security notes, platform support, OpenAI terms,
-and workspace policies still apply.
-
 ### Use a local model in Codex (experimental)
 
 LM Studio can run as a second local backend alongside Ollama. Its models use
@@ -2356,6 +2383,93 @@ service only when no installed client still uses it.
 `uninstall` intentionally retains the checkout, logs, backups, internal keys,
 and provider credentials so routine removal cannot destroy authentication or
 recovery data.
+
+## Make models appear in opencode, pi, omp, Command Code, and Hermes Agent
+
+Five more coding clients keep their providers in a configuration document you
+also own. The Control Center's Harness page lists each of them, and **Set up**
+is the whole integration: install the client's CLI when this router can, then
+write the one provider key the router owns into that document.
+
+| Client | Document the router edits | Wire | Install |
+| --- | --- | --- | --- |
+| opencode | `~/.config/opencode/opencode.json` | Responses | `opencode-ai` |
+| pi | `~/.pi/agent/models.json` | Responses | `@earendil-works/pi-coding-agent` |
+| omp (oh-my-pi) | `~/.omp/agent/models.yml` | Responses | install omp yourself first ([omp.sh](https://omp.sh/); it runs on Bun) |
+| Command Code | `~/.commandcode/providers.json` | Anthropic Messages | `command-code` 1.30.0 or later (setup updates an older one) |
+| Hermes Agent | `~/.hermes/config.yaml` | Anthropic Messages | install Hermes yourself first |
+
+opencode honours `OPENCODE_CONFIG`, pi and omp both honour
+`PI_CODING_AGENT_DIR`, and omp's `models.yaml` is edited in place when it has
+no `models.yml` beside it, so the router writes the file each client actually
+reads.
+
+From the terminal, the same action is one command per client:
+
+```sh
+./bin/control client-setup opencode
+./bin/control client-setup pi
+./bin/control client-setup omp
+./bin/control client-setup commandcode
+./bin/control client-setup hermes
+
+./bin/control client-disconnect opencode
+```
+
+**Keeping them current is its own command.** Setup installs a client that is
+missing, but deliberately leaves one that is already there at the version you
+have — bumping a global coding agent is not something that should happen
+because you republished a model list. To move them:
+
+```sh
+./bin/control client-update opencode   # runs `opencode upgrade`
+./bin/control client-update --all      # every client you actually have
+```
+
+Each runs the client's *own* updater (`opencode upgrade`, `pi update --self`,
+`command-code update`, `hermes update --yes`) rather than `npm install -g`, so
+a CLI you installed with Homebrew or a `curl | sh` script is updated in place
+instead of gaining a second npm copy that may win or lose on PATH. omp has
+neither, so its row prints the project's own installs. `--all` skips clients
+you have not installed and reports each one rather than stopping at the first
+failure. The Harness page has the same thing as an **Update** button per row
+and **Update all** in the header.
+
+Each client is published *into* rather than installed *as*: there is no
+`MODEL_ROUTER_TARGET` for these five and no second service. They share the
+router plane every other client uses, so enabling a provider, storing a key, or
+curating a model republishes all of them together and no picker is left
+advertising a model the others just lost.
+
+**The wire is one the router already serves.** Clients that speak the Responses
+API are pointed at the authenticated loopback `/v1` path with the router's own
+slugs. Command Code and Hermes have no Responses client, so they are pointed at
+the same Anthropic Messages surface Claude Code uses, with
+`codex_router/anthropic/<router-slug>` ids. No client is handed a protocol the
+router does not implement.
+
+**The router owns one key and nothing else.** That is
+`provider.codex-router` (opencode, Command Code) or `providers.codex-router`
+(pi, omp, Hermes), plus a private publication marker in the router's own state
+directory. YAML documents are spliced by line range rather than parsed and
+rewritten, so comments, hand-formatting, and every sibling provider survive a
+publish. A JSON document the router cannot round-trip — one carrying `//`
+comments, or an `opencode.jsonc` sitting beside `opencode.json` — is refused
+with an explanation rather than reformatted.
+
+A `codex-router` provider whose base URL this router did not issue is treated
+as somebody else's: both setup and disconnect refuse rather than overwrite it.
+opencode's default model is claimed only when you have not chosen one, and is
+released again the moment you pick your own. Every published document is
+written `0600`, because the base URL carries the local caller capability as a
+path segment.
+
+Removing one of these clients never retires the shared service while another
+client is still pointed at it:
+
+```sh
+./bin/control client-disconnect hermes
+```
 
 ## Updates and rollback
 

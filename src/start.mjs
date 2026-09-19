@@ -18,6 +18,7 @@ import {
 } from "./paths.mjs";
 import { SHUTDOWN_DRAIN_MS, SHUTDOWN_FLUSH_MS } from "./http-utils.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
+import { describeChildExit, fatalExitFollowUp } from "./fatal-exit.mjs";
 import { gatewaySupervisorLimits, superviseGateway } from "./gateway-supervisor.mjs";
 import { writeLiteLlmConfig } from "./litellm-config.mjs";
 import { MODELS } from "./model-registry.mjs";
@@ -410,6 +411,15 @@ async function main() {
     router,
   );
 
+  // After router is healthy, refresh the native account catalog and check its
+  // cache plus the installed Codex binary for drift in the background.
+  // This runs async without blocking further startup or waiting for user commands.
+  import("./native-catalog-drift.mjs")
+    .then(({ republishOnNativeDrift }) => republishOnNativeDrift())
+    .catch((error) => {
+      console.error(`[codex-router] Native drift check failed: ${error.message}`);
+    });
+
   if (antigravityStartup.pendingActivationGeneration) {
     const promoted = await attemptAntigravityProbePromotionAfterReadiness({
       generation: antigravityStartup.pendingActivationGeneration,
@@ -483,9 +493,14 @@ async function main() {
     waitForExit(router, frontend.label),
   ]);
   if (!shuttingDown) {
+    // A Windows fatal status is named in the line itself (src/fatal-exit.mjs)
+    // and earns a capture pointer on the next one; every other exit renders
+    // exactly as before. Crash lines are never gated on CODEX_ROUTER_QUIET.
     console.error(
-      `[${frontendService}] ${result.label} exited (code=${String(result.code)}, signal=${String(result.signal)}).`,
+      `[${frontendService}] ${result.label} exited (${describeChildExit(result)}).`,
     );
+    const followUp = fatalExitFollowUp(result);
+    if (followUp) console.error(`[${frontendService}] ${followUp}`);
   }
   return result.code || 0;
 }

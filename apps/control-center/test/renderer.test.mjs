@@ -338,6 +338,23 @@ const bridgeSource = String.raw`
       operationListener?.({ action: "connectCursor", status: "completed", message: "Cursor routing verified." });
       return { configured: true, opened: true };
     },
+    disconnectCursor: async () => {
+      record("disconnectCursor");
+      operationListener?.({ action: "disconnectCursor", status: "started", message: "Fully quit Cursor. Disconnect will resume here automatically…" });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      cursorHarnessState = "install";
+      operationListener?.({ action: "disconnectCursor", status: "completed", message: "Cursor routing removed." });
+      return { removed: true };
+    },
+    disconnectHarness: async (harnessId) => {
+      record("disconnectHarness", harnessId);
+      if (harnessId === "cursor") {
+        cursorHarnessState = "install";
+        return { removed: true, harnessId };
+      }
+      if (harnessId === "openclaw") openclawHarnessConfigured = false;
+      return { removed: true, harnessId };
+    },
     launchHarness: async (harnessId, surface) => {
       record("launchHarness", harnessId, surface);
       return { opened: true };
@@ -421,6 +438,28 @@ const bridgeSource = String.raw`
                   usedPercent: 40,
                   remainingPercent: 60,
                   resetAt: 1790000000,
+                },
+              ],
+            },
+          },
+          {
+            id: "venice",
+            displayName: "Venice",
+            credentialType: "api",
+            totalTokens: 0,
+            requests: 0,
+            last24hTokens: 0,
+            last24hRequests: 0,
+            dailyUsageBuckets: [],
+            account: {
+              status: "available",
+              metrics: [
+                {
+                  kind: "balance",
+                  label: "DIEM balance",
+                  value: 8.25,
+                  currency: "DIEM",
+                  detail: "Daily DIEM allowance",
                 },
               ],
             },
@@ -570,6 +609,14 @@ const chromiumPath = [
   process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Google", "Chrome", "Application", "chrome.exe"),
 ].find((candidate) => candidate && existsSync(candidate));
 
+async function newEnglishTestPage(browser, options) {
+  const page = await browser.newPage(options);
+  await page.addInitScript(() => {
+    localStorage.setItem("codex-router-language", "en");
+  });
+  return page;
+}
+
 test("the production renderer exposes model discovery and picker actions", { timeout: 120_000 }, async () => {
   assert.equal(existsSync(path.join(dist, "index.html")), true, "npm test must build the renderer first");
   assert.ok(chromiumPath, "No Chromium executable is available for the Control Center renderer test.");
@@ -582,7 +629,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
   });
   const pageErrors = [];
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     // Windows hosted runners routinely spend about 30 seconds starting the
     // browser. Keep UI waits short and diagnostic without letting that startup
     // consume the whole integration-test deadline.
@@ -604,6 +651,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
       true,
     );
     await page.getByRole("heading", { name: "Usage", exact: true }).waitFor();
+    await page.getByText("8.25 DIEM", { exact: true }).waitFor();
     assert.equal(
       await page.evaluate(() => window.routerControlTest.navigate({ destination: "usage-resets", sourceId: "deepseek" })),
       true,
@@ -645,33 +693,35 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.equal(await harnessRows.nth(5).locator('[data-client-logo="codex"]').count(), 1);
     assert.deepEqual(
       await page.locator(".lhc-harness-table-head span").allTextContents(),
-      ["Client", "Runtime", "Models", "Sessions", "Actions"],
+      ["Client", "Models", "Sessions", "Actions"],
     );
-    assert.equal(await page.getByText("1 published", { exact: true }).count(), 5);
-    assert.equal(await page.getByText("1 available", { exact: true }).count(), 1);
+    assert.equal(await page.locator(".lhc-harness-catalog").filter({ hasText: /^1$/ }).count(), 6);
     assert.equal(await page.getByLabel("Stable public HTTPS origin").count(), 0);
     assert.deepEqual(
-      (await page.locator(".lhc-harness-actions button").allTextContents()).map((label) => label.trim()),
-      ["Open", "Open", "Open", "Open", "Open", "Open"],
+      await harnessRows.evaluateAll((rows) => rows.map((row) => row.querySelectorAll(".lhc-harness-actions button").length)),
+      [2, 2, 2, 2, 2, 2],
     );
     for (const client of ["OpenClaw", "Cursor", "Claude Code", "Gemini CLI", "DeepSeek Harness", "Codex"]) {
-      assert.equal(await page.getByRole("button", { name: `Open ${client}`, exact: true }).count(), 1);
+      assert.equal(await page.getByRole("button", { name: `Open ${client} app`, exact: true }).count(), 1);
+      assert.equal(await page.getByRole("button", { name: `Open ${client} terminal`, exact: true }).count(), 1);
+      assert.equal(await page.getByRole("checkbox", { name: `Route ${client} through Codex Router`, exact: true }).count(), 1);
     }
-    assert.deepEqual(
-      await harnessRows.evaluateAll((rows) => rows.map((row) => row.querySelectorAll(".lhc-harness-actions button").length)),
-      [1, 1, 1, 1, 1, 1],
-    );
-    assert.equal(await page.getByRole("button", { name: /documentation|terminal|agent/i }).count(), 0);
-    await harnessRows.nth(0).getByRole("button", { name: "Open OpenClaw", exact: true }).click();
+    assert.equal(await page.getByRole("button", { name: /documentation|agent/i }).count(), 0);
+    await harnessRows.nth(0).getByRole("button", { name: "Open OpenClaw app", exact: true }).click();
     assert.deepEqual(
       await page.evaluate(() => window.routerControlTest.calls().find((call) => call.name === "launchHarness")),
       { name: "launchHarness", args: ["openclaw", "app"] },
     );
+    await harnessRows.nth(0).getByRole("button", { name: "Open OpenClaw terminal", exact: true }).click();
+    assert.deepEqual(
+      await page.evaluate(() => window.routerControlTest.calls().filter((call) => call.name === "launchHarness").at(-1)),
+      { name: "launchHarness", args: ["openclaw", "terminal"] },
+    );
     await page.evaluate(() => window.routerControlTest.setOpenClawHarnessConfigured(false));
     await page.getByRole("button", { name: "Context Manager", exact: true }).click();
     await page.getByRole("button", { name: "Harness Experimental", exact: true }).click();
-    await harnessRows.nth(0).getByRole("button", { name: "Set up", exact: true }).click();
-    await harnessRows.nth(0).getByRole("button", { name: "Open OpenClaw", exact: true }).waitFor();
+    await harnessRows.nth(0).getByRole("button", { name: "Set up OpenClaw", exact: true }).click();
+    await harnessRows.nth(0).getByRole("button", { name: "Open OpenClaw app", exact: true }).waitFor();
     assert.equal(
       await page.evaluate(() => window.routerControlTest.calls()
         .filter((call) => call.name === "setupHarness" && call.args[0] === "openclaw").length),
@@ -679,8 +729,8 @@ test("the production renderer exposes model discovery and picker actions", { tim
     );
     assert.equal(await page.locator(".lhc-agent-bridges").count(), 0);
     assert.deepEqual(
-      await page.locator(".lhc-harness-bridge strong").allTextContents(),
-      ["Available", "Available", "Not detected"],
+      await page.locator(".lhc-harness-bridge").allTextContents(),
+      ["Agent · 1", "Agent · 2"],
     );
     const rowBoxes = await harnessRows.evaluateAll((rows) => rows.map((row) => {
       const box = row.getBoundingClientRect();
@@ -703,13 +753,12 @@ test("the production renderer exposes model discovery and picker actions", { tim
       };
       return {
         identity: box(":scope > header"),
-        runtime: box(".lhc-harness-runtime"),
         catalog: box(".lhc-harness-catalog"),
         sessions: box(".lhc-harness-sessions"),
         actions: box(":scope > footer"),
       };
     }));
-    for (const column of ["identity", "runtime", "catalog", "sessions", "actions"]) {
+    for (const column of ["identity", "catalog", "sessions", "actions"]) {
       assert.equal(harnessColumns.every((row) => Math.abs(row[column].x - harnessColumns[0][column].x) < 1), true);
       assert.equal(harnessColumns.every((row) => Math.abs(row[column].width - harnessColumns[0][column].width) < 1), true);
     }
@@ -723,14 +772,33 @@ test("the production renderer exposes model discovery and picker actions", { tim
     await page.evaluate(() => window.routerControlTest.setCursorHarnessState("install"));
     await page.getByRole("button", { name: "Context Manager", exact: true }).click();
     await page.getByRole("button", { name: "Harness Experimental", exact: true }).click();
-    await page.getByRole("button", { name: "Connect Cursor", exact: true }).click();
+    await page.getByRole("button", { name: "Set up Cursor", exact: true }).click();
     const cursorProgress = page.getByRole("progressbar", { name: "Cursor setup progress" });
     await cursorProgress.waitFor();
     assert.match(await harnessRows.nth(1).innerText(), /Installing Cloudflare connector/);
-    await harnessRows.nth(1).getByRole("button", { name: "Open Cursor", exact: true }).waitFor();
+    await harnessRows.nth(1).getByRole("button", { name: "Open Cursor app", exact: true }).waitFor();
     assert.equal(await cursorProgress.count(), 0);
     assert.equal(
       await page.evaluate(() => window.routerControlTest.calls().filter((call) => call.name === "connectCursor").length),
+      1,
+    );
+    const cursorHintWrap = harnessRows.nth(1).locator(".lhc-harness-hint");
+    const cursorHintTip = cursorHintWrap.locator(".lhc-harness-hint-tooltip");
+    const cursorRoute = harnessRows.nth(1).getByRole("checkbox", { name: "Route Cursor through Codex Router", exact: true });
+    await page.mouse.move(0, 0);
+    assert.equal(await cursorHintTip.evaluate((node) => getComputedStyle(node).visibility), "hidden");
+    await cursorRoute.focus();
+    await cursorHintTip.waitFor({ state: "visible" });
+    assert.match(await cursorHintTip.textContent(), /Custom API keys/);
+    await cursorRoute.evaluate((node) => node.blur());
+    await page.mouse.move(0, 0);
+    await cursorHintTip.waitFor({ state: "hidden" });
+    await cursorHintWrap.hover();
+    await cursorHintTip.waitFor({ state: "visible" });
+    await cursorRoute.click();
+    await harnessRows.nth(1).getByRole("button", { name: "Set up Cursor", exact: true }).waitFor();
+    assert.equal(
+      await page.evaluate(() => window.routerControlTest.calls().filter((call) => call.name === "disconnectCursor").length),
       1,
     );
     await page.getByRole("button", { name: "Context Manager", exact: true }).click();
@@ -869,7 +937,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
       .some((call) => call.name === "setChatGptAccountSelection" && call.args[0] === "current"));
 
     // Add/remove must paint before the durable control round-trip finishes.
-    const optimisticPage = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const optimisticPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     optimisticPage.setDefaultTimeout(10_000);
     await optimisticPage.goto(`${url}?accountMutationDelayMs=1500`, { waitUntil: "domcontentloaded" });
     await optimisticPage.getByRole("button", { name: "Settings", exact: true }).click();
@@ -923,7 +991,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
       "hf.co/unsloth/GLM-5.3-Flash-GGUF:UD-IQ1_S",
     );
 
-    const cancelledLoginPage = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const cancelledLoginPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     const cancelledLoginErrors = [];
     cancelledLoginPage.setDefaultTimeout(10_000);
     cancelledLoginPage.on("pageerror", (error) => cancelledLoginErrors.push(error.message));
@@ -951,7 +1019,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.deepEqual(cancelledLoginErrors, []);
     await cancelledLoginPage.close();
 
-    const rejectedLoginPage = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const rejectedLoginPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     const rejectedLoginErrors = [];
     rejectedLoginPage.setDefaultTimeout(10_000);
     rejectedLoginPage.on("pageerror", (error) => rejectedLoginErrors.push(error.message));
@@ -979,7 +1047,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     assert.deepEqual(rejectedLoginErrors, []);
     await rejectedLoginPage.close();
 
-    const pendingRemovalPage = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const pendingRemovalPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     pendingRemovalPage.setDefaultTimeout(10_000);
     await pendingRemovalPage.goto(`${url}?loginStaysPending=1`, { waitUntil: "domcontentloaded" });
     await pendingRemovalPage.getByRole("button", { name: "Settings", exact: true }).click();
@@ -994,7 +1062,7 @@ test("the production renderer exposes model discovery and picker actions", { tim
     );
     await pendingRemovalPage.close();
 
-    const corruptPoolPage = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const corruptPoolPage = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     const corruptPoolErrors = [];
     corruptPoolPage.setDefaultTimeout(10_000);
     corruptPoolPage.on("pageerror", (error) => corruptPoolErrors.push(error.message));
@@ -1033,7 +1101,7 @@ test("fallback-only splits do not claim account breakdown or a complete range mi
   });
   const pageErrors = [];
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     page.setDefaultTimeout(10_000);
     page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("console", (message) => {
@@ -1086,7 +1154,7 @@ test("independent control-center reads reveal each ready page region", { timeout
   });
   const pageErrors = [];
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     page.setDefaultTimeout(10_000);
     page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("console", (message) => {
@@ -1097,10 +1165,13 @@ test("independent control-center reads reveal each ready page region", { timeout
       waitUntil: "domcontentloaded",
       timeout: 30_000,
     });
-    // Only the responsiveness checks use the tight budget. A cold browser
-    // navigation includes process and module startup and needs a normal timeout.
+    // Cold Chromium on Windows hosted runners can commit the first React paint
+    // after DOMContentLoaded. Keep this wait under snapshotDelayMs=3000 so a
+    // heading that waited for the delayed snapshot still fails.
+    await page.getByRole("heading", { name: "Dashboard", exact: true }).waitFor({
+      timeout: 2_500,
+    });
     page.setDefaultTimeout(1_500);
-    await page.getByRole("heading", { name: "Dashboard", exact: true }).waitFor();
     await page.locator(".service-health-strip").waitFor();
     await page.locator('.db-breakdown-list[aria-label="Providers usage breakdown"]')
       .getByText("DeepSeek", { exact: true })
@@ -1135,7 +1206,7 @@ test("usage polling surfaces current rejections, recovers, and ignores older res
   });
   const pageErrors = [];
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     page.setDefaultTimeout(10_000);
     page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("console", (message) => {
@@ -1177,7 +1248,7 @@ test("an older rejected usage read cannot replace a newer success with a warning
   });
   const pageErrors = [];
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     page.setDefaultTimeout(10_000);
     page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("console", (message) => {
@@ -1210,7 +1281,7 @@ test("health polling and core refresh share latest-wins ordering", { timeout: 12
   });
   const pageErrors = [];
   try {
-    const page = await browser.newPage({ viewport: { width: 1280, height: 840 } });
+    const page = await newEnglishTestPage(browser, { viewport: { width: 1280, height: 840 } });
     page.setDefaultTimeout(10_000);
     page.on("pageerror", (error) => pageErrors.push(error.message));
     page.on("console", (message) => {

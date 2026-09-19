@@ -391,6 +391,40 @@ test("the Windows CLI exposes tray as a first-class command", () => {
   }
 });
 
+// `control tray` prints enable|disable|status|restart|refresh|rebuild in its
+// own usage line, and the Windows wrapper accepted install|uninstall for the
+// first two, so following that usage line on Windows died on "Unknown tray
+// action 'disable'" (issue #751). Both surfaces are parsed here rather than
+// asserting one spelling, so a later rename of either one is caught.
+test("the Windows tray verbs accept every control tray command", () => {
+  const script = readFileSync(path.join(root, "codex-router.ps1"), "utf8");
+  const control = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const pairs = (source, pattern, entry) => {
+    const body = source.match(pattern)?.[1];
+    assert.ok(body, `could not read ${pattern}`);
+    return new Map([...body.matchAll(entry)].map((match) => [match[1], match[2]]));
+  };
+  const commands = pairs(control, /const TRAY_COMMANDS = \{([^}]*)\}/, /(\w+):\s*"([^"]+)"/g);
+  const aliases = pairs(script, /\$TrayActionAliases = @\{([^}]*)\}/, /"(\w+)"\s*=\s*"([^"]+)"/g);
+  const accepted = script.match(/\$Action -notin @\(([^)]*)\)/)?.[1];
+  assert.ok(accepted, "the tray action validator should remain readable");
+  const actions = new Set([...accepted.matchAll(/"([^"]+)"/g)].map((match) => match[1]));
+  assert.ok(commands.size >= 4, "control tray should still name its commands");
+  for (const [command, subcommand] of commands) {
+    const resolved = aliases.get(command) ?? command;
+    assert.ok(actions.has(resolved), `codex-router.ps1 tray ${command} is unreachable`);
+    // An alias must reach the same supervisor transaction control reaches, not
+    // merely some accepted verb.
+    assert.equal(resolved, subcommand, `tray ${command} must map to ${subcommand}`);
+  }
+  // The aliases are folded in before validation, so an aliased action reaches
+  // the same transaction the canonical spelling does.
+  assert.ok(
+    script.indexOf("$TrayActionAliases.ContainsKey($Action)") < script.indexOf("$Action -notin @("),
+    "the control aliases must be resolved before the action is validated",
+  );
+});
+
 test("tray rebuild registers the artifact it just built", () => {
   const script = readFileSync(path.join(root, "codex-router.ps1"), "utf8");
   const rebuild = script.slice(

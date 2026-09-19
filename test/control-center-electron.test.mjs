@@ -223,7 +223,9 @@ test("ChatGPT browser login has a bounded post-handoff completion deadline", asy
       onExit: (value) => { outcome = value; },
     });
     assert.deepEqual(opened, { opened: true, surface: "browser" });
-    const deadline = Date.now() + 2_000;
+    // The 40 ms completion deadline above is what is under test; this is only
+    // how long we are willing to wait for the process to report it.
+    const deadline = Date.now() + 20_000;
     while (!outcome && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
@@ -633,6 +635,25 @@ test("Linux tray-only mode trusts only a positively registered StatusNotifier ho
   }), false);
 });
 
+// The fixture records its descendant as soon as it is spawned, but the whole
+// command can be terminated before that write lands on a busy machine. Wait
+// briefly and say what happened: reading the file directly reported a bare
+// ENOENT that read as a missing temp directory rather than a descendant that
+// never started.
+async function readPidFile(pidFile, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { return await readFile(pidFile, "utf8"); }
+    catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      if (Date.now() >= deadline) {
+        assert.fail(`the command fixture never recorded a descendant pid in ${pidFile}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+}
+
 async function waitForProcessExit(pid, timeoutMs = 4_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -661,8 +682,14 @@ async function makeProcessTreeControlRoot() {
       // Hold the command's stdout/stderr pipes open after its leader exits, so
       // the runner has to act on `exit` rather than waiting forever for `close`.
       'const descendant = spawn(process.execPath, ["-e", worker], { stdio: ["ignore", "inherit", "inherit", "ipc"] });',
+      // The timeout mode is killed on a deadline, so record the descendant as
+      // soon as it has a pid. Waiting for its IPC "ready" first put a second
+      // Node startup inside that deadline, and a loaded runner spent it: the
+      // tree was terminated correctly and the test then read no pid file at
+      // all. The other modes still report after the handshake.
+      'if (mode === "timeout") writeFileSync(pidFile, String(descendant.pid));',
       'descendant.once("message", () => {',
-      '  writeFileSync(pidFile, String(descendant.pid));',
+      '  if (mode !== "timeout") writeFileSync(pidFile, String(descendant.pid));',
       '  if (mode === "success") process.exit(0);',
       '  if (mode === "failure") process.exit(7);',
       '  if (mode === "overflow") process.stdout.write("x".repeat(4096));',
@@ -1289,6 +1316,8 @@ test("preload exposes only the named control operations", async () => {
     "setupHarness",
     "prepareCursorTunnel",
     "connectCursor",
+    "disconnectCursor",
+    "disconnectHarness",
     "openHarnessSession",
     "openExternal",
   ]) {
@@ -1367,6 +1396,8 @@ test("preload constructs exact positional IPC payloads", async () => {
     ["setupHarness", ["cursor", "cursor-router.example.com"], { harnessId: "cursor", hostname: "cursor-router.example.com" }],
     ["prepareCursorTunnel", [], null],
     ["connectCursor", ["cursor-router.example.com"], { hostname: "cursor-router.example.com" }],
+    ["disconnectCursor", [], null],
+    ["disconnectHarness", ["openclaw"], { harnessId: "openclaw" }],
     ["openHarnessSession", ["codex", "session", "terminal", "model"], { harnessId: "codex", sessionId: "session", surface: "terminal", model: "model" }],
     ["openExternal", ["https://example.com"], { url: "https://example.com" }],
   ];
@@ -1846,7 +1877,30 @@ test("control center focus feedback uses state changes without focus rings", asy
 
 test("harness and context IPC remain fixed and session-scoped", async () => {
   const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
-  assert.match(source, /const HARNESS_IDS = \["codex", "dsh", "gemini", "cursor", "claude", "openclaw"\]/);
+  assert.match(
+    source,
+    /const HARNESS_IDS = \["codex", "dsh", "gemini", "cursor", "claude", "openclaw", \.\.\.ROUTED_HARNESS_IDS\]/,
+  );
+  // The document-configured rows are a fixed table, not a discovered one: the
+  // app must be able to draw the Harness tab before it can load a module out
+  // of the installed router, so their ids, markers, and executables are pinned
+  // here the same way every other client surface is.
+  assert.match(source, /const ROUTED_HARNESS_IDS = ROUTED_HARNESS_ROWS\.map\(\(row\) => row\.id\)/);
+  for (const [id, marker] of [
+    ["opencode", "opencode-models.json"],
+    ["pi", "pi-models.json"],
+    ["omp", "omp-models.json"],
+    ["commandcode", "commandcode-models.json"],
+    ["hermes", "hermes-models.json"],
+  ]) {
+    assert.match(source, new RegExp(`id: "${id}",`));
+    assert.match(source, new RegExp(`marker: "${marker}"`));
+  }
+  // Hermes installs from a remote shell script. Offering to run that on the
+  // user's behalf is exactly what this router does not do.
+  assert.match(source, /id: "hermes",[\s\S]*?installable: false/);
+  assert.match(source, /existsSync\(path\.join\(stateDirectory, row\.marker\)\)/);
+  assert.match(source, /environmentOverrides\[routedSetup\.binEnv\] = binary/);
   assert.match(source, /const HARNESS_SURFACES = \["app", "terminal"\]/);
   assert.match(source, /const SESSION_UUID = \/\^\[0-9a-f\]/);
   assert.match(source, /const DSH_SESSION_ID = \/\^session-/);
@@ -1942,20 +1996,48 @@ test("Harness page renders fixed client rows backed by the shared session index"
     "utf8",
   );
 
-  assert.match(harness, /const CLIENT_ORDER: HarnessId\[\] = \["openclaw", "cursor", "claude", "gemini", "dsh", "codex"\]/);
+  assert.match(
+    harness,
+    /const CLIENT_ORDER: HarnessId\[\] = \[\s*"openclaw", "cursor", "claude", "gemini", "dsh", "codex",\s*"opencode", "pi", "omp", "commandcode", "hermes",\s*\]/,
+  );
+  // The pre-existing six keep their positions so an upgrade does not move a
+  // user's rows out from under them.
+  assert.ok(
+    harness.indexOf('"openclaw", "cursor", "claude", "gemini", "dsh", "codex",')
+      < harness.indexOf('"opencode", "pi", "omp", "commandcode", "hermes",'),
+  );
+  assert.match(harness, /const TERMINAL_ONLY_CLIENTS = new Set<HarnessId>\(\["opencode", "pi", "omp", "commandcode", "hermes"\]\)/);
   assert.match(harness, /api\.getContextSessions\(\)/);
   assert.match(harness, /api\.getAgentBridges\(\)/);
-  assert.match(harness, /Official-client agent/);
+  assert.match(harness, /Agent · \$\{bridge\.sessions\}|Agent/);
   assert.match(harness, /bridgeForHarness\(harness\.id, agentBridges\)/);
   assert.doesNotMatch(harness, /Subscription agent bridges|Credentials.*Unavailable/);
   assert.match(harness, /api\.connectCursor\(cursorHostname\.trim\(\) \|\| undefined\)/);
+  assert.match(harness, /api\.disconnectCursor\(\)/);
+  assert.match(harness, /api\.disconnectHarness\(harness\.id\)/);
+  assert.match(harness, /Route \$\{harness\.displayName\} through Codex Router/);
+  assert.match(harness, /Custom API keys/);
   assert.match(harness, /Use an existing Cloudflare hostname/);
-  assert.match(harness, /Connect Cursor/);
-  assert.match(harness, /One guided setup/);
+  assert.match(harness, /lhc-harness-toolbar/);
+  assert.match(harness, /lhc-harness-hint-tooltip/);
+  assert.doesNotMatch(harness, /CircleHelp/);
+  assert.match(harness, /Turn Route on to install the connector/);
   assert.match(harness, /Cursor setup progress/);
-  assert.match(harness, /api\.launchHarness\(harness\.id, "app"\)/);
-  assert.match(harness, /<AppWindow[^>]*\/> Open/);
-  assert.doesNotMatch(harness, /BookOpen|SquareTerminal|Open agent/);
+  assert.match(styles, /\.lhc-harness-toolbar/);
+  assert.match(styles, /\.lhc-harness-hint-tooltip/);
+  assert.match(styles, /\.lhc-harness-hint:hover/);
+  assert.match(styles, /\.lhc-harness-launch/);
+  assert.match(styles, /\.lhc-harness-icon-btn/);
+  assert.match(styles, /minmax\(220px, 1\.6fr\) 56px 56px 168px/);
+  assert.match(harness, /lhc-harness-setup-btn/);
+  assert.match(harness, /lhc-harness-launch/);
+  assert.match(harness, /className="lhc-harness-setup-btn"/);
+  assert.doesNotMatch(harness, /openHintId|aria-expanded=\{hintOpen\}|Show routing tip/);
+  assert.doesNotMatch(styles, /\.lhc-harness-hint-panel/);
+  assert.match(harness, /api\.launchHarness\(harness\.id, surface\)/);
+  assert.match(harness, /<AppWindow aria-hidden size=\{14\} strokeWidth=\{1\.7\} \/>/);
+  assert.match(harness, /<SquareTerminal aria-hidden size=\{14\} strokeWidth=\{1\.7\} \/>/);
+  assert.doesNotMatch(harness, /BookOpen|Open agent|TERMINAL_ONLY_CLIENTS\.has\(harness\.id\) && harness\.cliInstalled/);
   assert.doesNotMatch(harness, /Stable public HTTPS origin|127\.0\.0\.1:4214/);
   assert.match(harness, /assets\/clients\/cursor\.svg/);
   assert.match(harness, /assets\/clients\/deepseek-harness\.svg/);
@@ -2177,11 +2259,15 @@ for (const mode of ["timeout", "overflow"]) {
       const command = runControl(
         [pidFile, mode],
         mode === "timeout"
-          ? { timeoutMs: process.platform === "win32" ? 2_000 : 250 }
+          // Long enough that the fixture's own Node startup fits inside it on
+          // a loaded runner -- the deadline is what is under test, not how
+          // fast a process can boot. A 250 ms budget failed outright once the
+          // machine was busy, and the tree was never the reason.
+          ? { timeoutMs: process.platform === "win32" ? 6_000 : 3_000 }
           : { timeoutMs: 5_000, maxOutputBytes: 32 },
       );
       await assert.rejects(command, mode === "timeout" ? /timed out/ : /output exceeded/);
-      descendantPid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
+      descendantPid = Number.parseInt(await readPidFile(pidFile), 10);
       assert.ok(Number.isInteger(descendantPid) && descendantPid > 0);
       await waitForProcessExit(descendantPid);
     } finally {
@@ -2208,11 +2294,13 @@ for (const { mode, expectedCode } of [
     try {
       process.env.CODEX_ROUTER_SOURCE_ROOT = root;
       const result = await runControl([pidFile, mode], {
-        timeoutMs: 5_000,
+        // Only has to outlast two Node startups on a busy runner; a passing
+        // command returns as soon as it is done and never spends this.
+        timeoutMs: 30_000,
         allowNonZero: true,
       });
       assert.equal(result.code, expectedCode);
-      descendantPid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
+      descendantPid = Number.parseInt(await readPidFile(pidFile), 10);
       assert.ok(Number.isInteger(descendantPid) && descendantPid > 0);
       await waitForProcessExit(descendantPid);
       await new Promise((resolve) => setTimeout(resolve, 700));

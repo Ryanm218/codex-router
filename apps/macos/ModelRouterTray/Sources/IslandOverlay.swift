@@ -346,7 +346,7 @@ private struct IslandOverlayView: View {
         }
         Spacer()
         HStack(spacing: 12) {
-          IslandHeaderMetric(value: todayTokenValue, label: routerLocalized("TODAY TOKENS"))
+          IslandHeaderMetric(value: todayTokenValue, label: "\(routerLocalized("TODAY TOKENS")) · UTC")
           if let accountHeaderValue {
             IslandHeaderMetric(value: accountHeaderValue, label: accountHeaderLabel)
           }
@@ -377,7 +377,7 @@ private struct IslandOverlayView: View {
         }
         Spacer()
         HStack(spacing: 12) {
-          IslandHeaderMetric(value: todayTokenValue, label: routerLocalized("TODAY TOKENS"))
+          IslandHeaderMetric(value: todayTokenValue, label: "\(routerLocalized("TODAY TOKENS")) · UTC")
           if let accountHeaderValue {
             IslandHeaderMetric(value: accountHeaderValue, label: accountHeaderLabel)
           }
@@ -941,13 +941,13 @@ private struct IslandUsageLineChart: View {
 
   private func axisLabel(for point: DailyUsagePoint) -> String {
     if points.count <= 7 {
-      return point.date.formatted(.dateTime.weekday(.abbreviated))
+      return point.date.usageDayLabel(.dateTime.weekday(.abbreviated))
     }
-    return point.date.formatted(.dateTime.month(.defaultDigits).day())
+    return point.date.usageDayLabel(.dateTime.month(.defaultDigits).day())
   }
 
   private func hoverText(for point: DailyUsagePoint) -> String {
-    let date = point.date.formatted(.dateTime.month(.abbreviated).day())
+    let date = point.date.usageDayLabel(.dateTime.month(.abbreviated).day())
     let tokens = Int64(point.tokens).formatted(.number.grouping(.automatic))
     let text = RouterLanguage.isSimplifiedChinese ? "\(date) · \(tokens) token" : "\(date) · \(tokens) tok"
     guard point.isRouterFallback else { return text }
@@ -1082,6 +1082,7 @@ struct ProviderIcon: View {
 
   private var assetName: String? {
     if providerID == "openai" { return "openai" }
+    if providerID == "vertex" { return "google" }
     if providerID.hasPrefix("grok") { return "grok" }
     if providerID.hasPrefix("kimi") { return "kimi" }
     if providerID == "deepseek" { return "deepseek" }
@@ -1109,11 +1110,12 @@ struct ProviderIcon: View {
   private var assetExtension: String {
     // Keyed off the asset, not the provider id, so every route sharing a mark
     // (opencode-go and friends) resolves the same file type.
-    ["github-copilot", "chutes", "opencode-free", "kilo-free", "nano-gpt"].contains(assetName ?? "") ? "svg" : "png"
+    ["github-copilot", "chutes", "google", "opencode-free", "kilo-free", "nano-gpt"].contains(assetName ?? "") ? "svg" : "png"
   }
 
   private var providerName: String {
     if providerID == "openai" { return "ChatGPT" }
+    if providerID == "vertex" { return "Google Cloud Vertex AI" }
     if providerID.hasPrefix("grok") { return "Grok" }
     if providerID.hasPrefix("kimi") { return "Kimi" }
     if providerID == "deepseek" { return "DeepSeek" }

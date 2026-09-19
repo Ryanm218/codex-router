@@ -16,7 +16,8 @@ $Commands = @(
   "setup", "install", "doctor", "status", "providers", "provider-key", "caller-key", "key-pool", "search-sidecar", "enable",
   "disable", "chatgpt-session", "skills", "uninstall", "update", "rollback", "support-bundle",
   "smoke-test", "start", "stop", "test-model", "discover-models", "local-mlx",
-  "signed-routing", "refresh-catalog", "media", "tray", "panel", "companion"
+  "signed-routing", "refresh-catalog", "media", "tray", "panel", "companion", "activity",
+  "picker-order"
 )
 if ($Command -notin $Commands) {
   throw "Unknown command '$Command'. Choose: $($Commands -join ', ')."
@@ -880,6 +881,7 @@ switch ($Command) {
   "provider-key" { Invoke-RouterNode "src\provider-key.mjs" $Arguments }
   "caller-key" { Invoke-RouterNode "src\caller-key.mjs" $Arguments }
   "key-pool" { Invoke-RouterNode "src\control.mjs" (@("key-pool") + $Arguments) }
+  "activity" { Invoke-RouterNode "src\control.mjs" (@("activity") + $Arguments) }
   "search-sidecar" { Invoke-RouterNode "src\search-sidecar-control.mjs" $Arguments }
   "chatgpt-session" { Invoke-RouterNode "src\chatgpt-session.mjs" $Arguments }
   "skills" { Invoke-RouterNode "src\skills-install.mjs" $Arguments }
@@ -949,8 +951,16 @@ switch ($Command) {
     } else {
       "interactive"
     }
+    # `control tray` names the two lifecycle verbs enable and disable, and this
+    # wrapper named the same transactions install and uninstall. So the one
+    # command the control surface's own usage line prints -- `tray disable` --
+    # died here on "Unknown tray action 'disable'" (issue #751). Fold the
+    # control aliases onto the supervisor verbs before validation so both
+    # surfaces accept the same words and dispatch the same transaction.
+    $TrayActionAliases = @{ "enable" = "install"; "disable" = "uninstall" }
+    if ($TrayActionAliases.ContainsKey($Action)) { $Action = $TrayActionAliases[$Action] }
     if ($Action -notin @("install", "refresh", "status", "start", "stop", "restart", "uninstall", "rebuild", "repair")) {
-      throw "Unknown tray action '$Action'. Choose: install, refresh, status, start, stop, restart, uninstall, rebuild, repair."
+      throw "Unknown tray action '$Action'. Choose: install, refresh, status, start, stop, restart, uninstall, rebuild, repair (enable and disable are accepted for install and uninstall)."
     }
     # A durable interrupted replacement is reconciled before any later
     # mutation. Status remains read-only; its next mutating follow-up performs
@@ -1128,6 +1138,27 @@ switch ($Command) {
     Write-Warning "'companion' is now an alias of the unified 'tray' command."
     & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath tray $Action
     exit $LASTEXITCODE
+  }
+  "picker-order" {
+    if ($Target -ne "codex") {
+      throw "Picker order is a Codex picker concept; other targets render their own catalogs."
+    }
+    $Action = if ($Arguments.Count) { [string]$Arguments[0] } else { "status" }
+    if ($Action -notin @("status", "native-first", "routed-first")) {
+      throw "Usage: picker-order status|native-first|routed-first"
+    }
+    Push-Location $Root
+    try {
+      if ($Action -ne "status") {
+        & node --input-type=module -e "import { setPickerOrder } from './src/model-picker-state.mjs'; setPickerOrder(process.argv[1])" $Action
+        if ($LASTEXITCODE -ne 0) { throw "picker-order exited with status $LASTEXITCODE." }
+        Invoke-RouterNode "src\catalog.mjs"
+      }
+      & node --input-type=module -e 'import { readPickerOrder, MODEL_PICKER_STATE_PATH } from "./src/model-picker-state.mjs"; process.stdout.write(readPickerOrder() + " " + MODEL_PICKER_STATE_PATH + "\n")'
+      if ($LASTEXITCODE -ne 0) { throw "picker-order exited with status $LASTEXITCODE." }
+    } finally {
+      Pop-Location
+    }
   }
 }
 

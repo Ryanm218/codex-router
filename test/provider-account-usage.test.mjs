@@ -1077,3 +1077,14 @@ test("the China Kimi platform is probed on its own host and currency", async () 
     delete process.env.KIMI_API_CN_KEY;
   }
 });
+
+test("Vertex usage does not probe Google Cloud and reports router traffic only", async () => {
+  const snapshot = await providerAccountUsageSnapshot({
+    providerIds: ["vertex"],
+    fetchImpl: async () => {
+      throw new Error("Vertex must not probe a Google Cloud billing API");
+    },
+  });
+  assert.equal(snapshot.vertex.status, "local-only");
+  assert.match(snapshot.vertex.message, /Google Cloud Console/);
+});

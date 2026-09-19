@@ -165,6 +165,7 @@ test("Chutes public-catalog fixtures drive discovery, deterministic curation, an
       blocked: {},
       unavailable: [],
       contextLengths: { "moonshotai/Kimi-K3-TEE": 262144 },
+      inputModalities: {},
       modelMetadata: [
         {
           upstreamId: "moonshotai/Kimi-K3-TEE",

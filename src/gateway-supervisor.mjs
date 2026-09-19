@@ -35,6 +35,8 @@
 //      hard-sets `CODEX_ROUTER_QUIET`, and a router that quietly resurrects a
 //      crashing gateway is indistinguishable from one that never failed.
 
+import { describeChildExit } from "./fatal-exit.mjs";
+
 export const DEFAULT_MAX_RESTARTS = 5;
 export const DEFAULT_RESTART_WINDOW_MS = 10 * 60_000;
 export const DEFAULT_RESTART_BACKOFF_MS = 1_000;
@@ -123,7 +125,10 @@ export async function superviseGateway({
     failures.push(at);
     while (failures.length > 0 && at - failures[0] > windowMs) failures.shift();
 
-    const describeExit = `code=${String(exit.code)}, signal=${String(exit.signal)}`;
+    // The exit fragment names a Windows fatal status when the code is one
+    // (src/fatal-exit.mjs) and renders byte-identical otherwise, so the
+    // restart lines classify a native abort without changing any other shape.
+    const describeExit = describeChildExit(exit);
     if (maxRestarts <= 0 || failures.length > maxRestarts) {
       log(
         maxRestarts <= 0

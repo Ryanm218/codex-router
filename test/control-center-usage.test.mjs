@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { accountBucketsWithRouterFallback } from "../apps/control-center/src/lib.ts";
+import { accountBucketsWithRouterFallback, metricValue } from "../apps/control-center/src/lib.ts";
 import { LANGUAGE_OPTIONS, translate } from "../apps/control-center/src/i18n.ts";
 
 test("account usage fills only absent OpenAI dates from the local router", () => {
@@ -86,4 +86,35 @@ test("fallback provenance is translated in every control-center language", () =>
       if (id === "en") assert.doesNotMatch(singular, /1 dates\b/);
     }
   }
+});
+
+test("a non-ISO balance ledger cannot take down Usage", () => {
+  assert.equal(
+    metricValue({ kind: "balance", label: "DIEM balance", value: 8.25, currency: "DIEM" }),
+    "8.25 DIEM",
+  );
+  assert.equal(
+    metricValue({ kind: "balance", label: "DIEM balance", value: 0, currency: "DIEM" }),
+    "0 DIEM",
+  );
+  assert.equal(
+    metricValue({ kind: "balance", label: "API balance", value: 12.5, currency: "USD" }),
+    "$12.50",
+  );
+});
+
+test("the daily window is walked in UTC days, the day space every bucket key uses", async () => {
+  const { bucketRange } = await import("../apps/control-center/src/lib.ts");
+  const utcToday = new Date().toISOString().slice(0, 10);
+  const range = bucketRange([{ startDate: utcToday, tokens: 4_242 }], 7);
+
+  assert.equal(range.length, 7);
+  // Keys must be plain UTC calendar days, ascending, ending on the current one.
+  assert.ok(range.every((bucket) => /^\d{4}-\d{2}-\d{2}$/.test(bucket.startDate)));
+  assert.deepEqual(range.map((bucket) => bucket.startDate).slice().sort(), range.map((bucket) => bucket.startDate));
+  assert.equal(range.at(-1).startDate, utcToday);
+  // The newest slot has to find today's account bucket. Walking local days
+  // asked for a key the UTC-keyed stream has not written yet whenever the
+  // machine is east of UTC, which read as a confident zero all morning.
+  assert.equal(range.at(-1).tokens, 4_242);
 });

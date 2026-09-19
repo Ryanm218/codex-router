@@ -1,5 +1,4 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -20,12 +19,16 @@ import {
   CONFIG_PATH,
   LEGACY_PORTS,
   MERGED_CATALOG_PATH,
-  MODELS_CACHE_PATH,
   NATIVE_ALIAS_PATH,
   NATIVE_CATALOG_PATH,
   PORTS,
 } from "./paths.mjs";
-import { codexAuthStatus, codexVersion, runCodex } from "./codex-binary.mjs";
+import {
+  codexAuthStatus,
+  codexBinaryFingerprint,
+  codexVersion,
+  runCodex,
+} from "./codex-binary.mjs";
 import { readUserModels } from "./user-models.mjs";
 import { syncRoutedCodexAgents } from "./codex-agent-catalog.mjs";
 import {
@@ -43,6 +46,7 @@ import {
   modelPickerSnapshot,
   readHiddenModels,
   seedModelsHidden,
+  readPickerOrder,
 } from "./model-picker-state.mjs";
 import { buildNativeAliasAssignments } from "./native-alias.mjs";
 import {
@@ -62,6 +66,11 @@ import {
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { withCatalogPublicationLock } from "./catalog-publication-lock.mjs";
 import { routedModelSearchAvailable } from "./search-capability.mjs";
+import {
+  readModelsCache,
+} from "./native-account-catalog.mjs";
+
+export { readModelsCache } from "./native-account-catalog.mjs";
 
 const refresh = process.argv.includes("--refresh-native");
 
@@ -183,23 +192,20 @@ export function mergeNativeModel(accountModel, bundledModel) {
   return merged;
 }
 
-// One read serves both the catalog contents and the fingerprint; reading the
-// file twice would hash a possibly different snapshot than the one merged.
-function readModelsCache() {
-  const missing = { catalog: undefined, fingerprint: undefined };
-  if (!existsSync(MODELS_CACHE_PATH)) return missing;
-  try {
-    const parsed = JSON.parse(readFileSync(MODELS_CACHE_PATH, "utf8"));
-    if (!validNativeCatalog(parsed)) return missing;
-    return {
-      catalog: parsed,
-      fingerprint: createHash("sha256")
-        .update(JSON.stringify(parsed.models))
-        .digest("hex"),
-    };
-  } catch {
-    return missing;
-  }
+// A valid account cache containing no routed slugs can be refreshed directly
+// and remains a safe native source while model_catalog_json points at the
+// merged router catalog. A missing or contaminated cache still takes the
+// conservative transport-transition path in refresh-catalog.
+export function nativeCacheCanRefreshInPlace(cache = readModelsCache()) {
+  const catalog = cache?.catalog;
+  return (
+    Boolean(validNativeCatalog(catalog)) &&
+    !catalog.models.some((model) => MODEL_BY_SLUG.has(String(model.slug)))
+  );
+}
+
+export function nativeCatalogCanRefreshInPlace() {
+  return discoveryDisabled() || nativeCacheCanRefreshInPlace();
 }
 
 function atomicContents(target, contents) {
@@ -314,9 +320,11 @@ function captureNative(cache) {
   }
   const capturedWith = codexVersion();
   const sourceFingerprint = cache.fingerprint;
+  const binaryFingerprint = codexBinaryFingerprint();
   atomicJson(NATIVE_CATALOG_PATH, {
     ...(capturedWith ? { captured_with: capturedWith } : {}),
     ...(sourceFingerprint ? { native_source_fingerprint: sourceFingerprint } : {}),
+    ...(binaryFingerprint ? { native_binary_fingerprint: binaryFingerprint } : {}),
     models: parsed.models,
   });
   return parsed;
@@ -331,6 +339,7 @@ export function nativeCatalogIsReusable(
   parsed,
   currentVersion,
   currentSourceFingerprint = undefined,
+  currentBinaryFingerprint = undefined,
 ) {
   if (!parsed || !Array.isArray(parsed.models) || parsed.models.length === 0) {
     return false;
@@ -339,6 +348,12 @@ export function nativeCatalogIsReusable(
   if (
     currentSourceFingerprint &&
     parsed.native_source_fingerprint !== currentSourceFingerprint
+  ) {
+    return false;
+  }
+  if (
+    currentBinaryFingerprint &&
+    parsed.native_binary_fingerprint !== currentBinaryFingerprint
   ) {
     return false;
   }
@@ -389,7 +404,14 @@ function nativeCatalog({ refreshNative = refresh } = {}) {
     }
   }
   const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
-  if (nativeCatalogIsReusable(parsed, codexVersion(), cache.fingerprint)) {
+  if (
+    nativeCatalogIsReusable(
+      parsed,
+      codexVersion(),
+      cache.fingerprint,
+      codexBinaryFingerprint(),
+    )
+  ) {
     return parsed;
   }
   try {
@@ -832,10 +854,11 @@ function pickerProviderGroup(provider) {
   if (value === "antigravity-oauth") return { rank: 0, key: "antigravity" };
   if (value === "deepseek") return { rank: 1, key: "deepseek" };
   // The opencode family shares one stored key: `opencode-go` and its variants
-  // (`opencode-go-messages`, `opencode-go-responses`, `opencode-zen`). Group
-  // them together so Zen models stay next to the Go models they relate to
-  // instead of falling into the rank-3 catch-all under their own key.
-  if (value.startsWith("opencode-go") || value === "opencode-zen") {
+  // (`opencode-go-messages`, `opencode-go-responses`, `opencode-zen` and the
+  // Zen Messages/Responses protocol variants). Group them together so Zen
+  // models stay next to the Go models they relate to instead of falling into
+  // the rank-3 catch-all under their own key.
+  if (value.startsWith("opencode-go") || value.startsWith("opencode-zen")) {
     return { rank: 2, key: "opencode" };
   }
   return { rank: 3, key: value };
@@ -949,7 +972,11 @@ function behaviorTemplateFor(nativeModels, model, fallback) {
   return nativeModels.find((candidate) => candidate.slug === model.behaviorTemplate) || fallback;
 }
 
-export function buildMergedCatalog(native, routedModelsList, { includeNative = true } = {}) {
+export function buildMergedCatalog(
+  native,
+  routedModelsList,
+  { includeNative = true, pickerOrder = "native-first" } = {},
+) {
   const template =
     native.models.find((model) => model.slug === "gpt-5.5") ||
     native.models.find((model) => model.visibility === "list") ||
@@ -957,13 +984,27 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
   if (!template) {
     throw new Error("Native model catalog is empty.");
   }
+  const ordered = routedPickerPriorities(native.models, routedModelsList);
+  const routedFirst = pickerOrder === "routed-first";
+  const published = publishedPickerPriorities(native.models, ordered, { routedFirst });
+  // Under routed-first every routed model was renumbered 1..N, so the natives
+  // move after them by the same count. Only the published priority changes;
+  // the native entry is otherwise the account's own.
+  const nativeShift = routedFirst ? published.size : 0;
   const models = new Map(
     includeNative
-      ? native.models.map((model) => [model.slug, normalizeNativeModel(model)])
+      ? native.models.map((model) => {
+          const normalized = normalizeNativeModel(model);
+          const priority = Number(normalized.priority);
+          return [
+            model.slug,
+            nativeShift && Number.isFinite(priority)
+              ? { ...normalized, priority: priority + nativeShift }
+              : normalized,
+          ];
+        })
       : [],
   );
-  const ordered = routedPickerPriorities(native.models, routedModelsList);
-  const published = publishedPickerPriorities(native.models, ordered);
   for (const model of ordered) {
     const behaviorTemplate = behaviorTemplateFor(native.models, model, template);
     const entry = routedModel(template, model, behaviorTemplate);
@@ -981,7 +1022,13 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
 // The band starts above the highest *visible* native priority: a hidden
 // native entry can carry an arbitrary number that would otherwise push every
 // routed model far down the picker for no reason a user can see.
-function publishedPickerPriorities(nativeModels, orderedRoutedModels) {
+//
+// With `routedFirst` the band starts at 1 instead and includes the v2 routes:
+// the operator asked for external models ahead of the natives, and leaving a
+// v2 route at its authored value would interleave it with the shifted natives
+// unpredictably. The spawn_agent override window shows a priority-ordered
+// subset, so those routes stay at the top of it either way.
+function publishedPickerPriorities(nativeModels, orderedRoutedModels, { routedFirst = false } = {}) {
   const visible = nativeModels.filter((model) => model.visibility === "list");
   const nativeMax = Math.max(
     0,
@@ -990,9 +1037,9 @@ function publishedPickerPriorities(nativeModels, orderedRoutedModels) {
       .filter(Number.isFinite),
   );
   const published = new Map();
-  let next = nativeMax + 1;
+  let next = routedFirst ? 1 : nativeMax + 1;
   for (const model of orderedRoutedModels) {
-    if (model.multiAgentVersion === "v2") continue;
+    if (model.multiAgentVersion === "v2" && !routedFirst) continue;
     published.set(model.slug, next);
     next += 1;
   }
@@ -1010,7 +1057,7 @@ function publishedPickerPriorities(nativeModels, orderedRoutedModels) {
 // merged-catalog path filters through `selectedConfiguredListedModels()`; this
 // function keeps the same rule for the login-free path instead of trusting its
 // caller to pre-filter, so no future call site can publish dead slots again.
-export function buildLoginFreeCatalog(native, routedModelsList) {
+export function buildLoginFreeCatalog(native, routedModelsList, { pickerOrder = "native-first" } = {}) {
   const configured = new Set(configuredProviderIds());
   const usableModels = routedModelsList.filter(
     (model) => !model.provider || configured.has(model.provider),
@@ -1030,7 +1077,7 @@ export function buildLoginFreeCatalog(native, routedModelsList) {
       slug: nativeModel.slug,
       priority: nativeModel.priority,
     })),
-    ...buildMergedCatalog(native, usableModels, { includeNative: false }).map(
+    ...buildMergedCatalog(native, usableModels, { includeNative: false, pickerOrder }).map(
       (model) =>
         aliasedSlugs.has(model.slug) ? { ...model, visibility: "hide" } : model,
     ),
@@ -1166,11 +1213,13 @@ export function publishCatalog({ refreshNative = refresh, output = true } = {}) 
     readVisionBridgeSettings(),
   );
   const catalogModels = applyVisionBridge(routedModels, visionEngine);
+  const pickerOrder = readPickerOrder();
   const { models: merged, aliases } = loginFree
-    ? buildLoginFreeCatalog(native, catalogModels)
+    ? buildLoginFreeCatalog(native, catalogModels, { pickerOrder })
     : {
         models: buildMergedCatalog(native, routedCatalog ? catalogModels : [], {
           includeNative: openaiAuthenticated,
+          pickerOrder,
         }),
         aliases: {},
       };

@@ -1000,6 +1000,12 @@ async function accountUsageFor(providerId, fetchImpl) {
       return withHeaderQuota(providerId, localOnly("Anonymous free-provider quota is not exposed; showing router traffic"));
     }
     if (providerId === "github-copilot") return await githubCopilotAccount(fetchImpl);
+    if (providerId === "vertex") {
+      return withHeaderQuota(
+        providerId,
+        localOnly("Google Cloud Console shows Vertex spend; showing router traffic"),
+      );
+    }
     // Every remaining provider — including the catalog-only ones — reports its
     // window through response headers or shows router traffic alone.
     return withHeaderQuota(providerId, localOnly("Showing router traffic"));
