@@ -931,6 +931,15 @@
   `control health` was. `control-health.mjs` remains the contract for the CLI
   and the Control Center. The bounded one-second polls during MLX install,
   runtime update, and vision-bridge pull still shell out and are unchanged.
+- **Grok OAuth 4xx, native-relay 429, and empty-completion prelude no longer
+  masquerade as a dead Grok gateway.** The Grok forwarder now preserves upstream
+  4xx (402 billing, 400 validation, 429 rate limit) instead of collapsing every
+  non-401 to HTTP 502, so quota failover and error translation can see a billing
+  refusal. Encrypted Codex collaboration relays retry native 429/503 twice, then
+  report 429 instead of 502, without sending ciphertext to Grok. `grok-oauth`
+  empty-completion prelude is 90s (override
+  `CODEX_ROUTER_GROK_EMPTY_COMPLETION_PRELUDE_MS`); other providers stay at 30s.
+
 - **Grok now sees `id` first on flattened tool schemas, so `automation_update`
   fills the identifier without being told.** Codex's live view branch declares
   `mode` then `id`. The union flatten used to keep that order, and Grok emits

@@ -133,6 +133,21 @@ export function hostedSearchEnabledFor(upstreamModel, models = MODELS) {
   );
 }
 
+// Billing and validation 4xx must reach the router as themselves. Collapsing
+// them to 502 made LiteLLM log BadGatewayError, skipped quota failover, and
+// sent Codex retrying an exhausted Grok Build balance as a dead gateway.
+export function grokForwarderClientStatus(status) {
+  return Number.isInteger(status) && status >= 400 && status < 500 ? status : 502;
+}
+
+export function grokForwarderErrorType(status) {
+  if (status === 401 || status === 403) return "authentication_error";
+  if (status === 402) return "billing_error";
+  if (status === 429) return "rate_limit_error";
+  if (Number.isInteger(status) && status >= 400 && status < 500) return "invalid_request_error";
+  return "api_error";
+}
+
 function grokClientVersion() {
   const fallbackVersion = VERSION.match(/\b(\d+\.\d+\.\d+)\b/)?.[1] || "0.0.0";
   const executable =
@@ -650,13 +665,14 @@ async function handleChatCompletions(request, response) {
 
   if (!upstream.ok || !upstream.body) {
     const detail = await upstream.text().catch(() => "");
-    writeJson(response, upstream.status === 401 ? 401 : 502, {
+    const status = grokForwarderClientStatus(upstream.status);
+    writeJson(response, status, {
       error: {
         message:
           upstream.status === 401
             ? "xAI rejected the Grok OAuth session; run `grok login --oauth`."
             : `Grok OAuth proxy error (HTTP ${upstream.status}).`,
-        type: upstream.status === 401 ? "authentication_error" : "api_error",
+        type: grokForwarderErrorType(upstream.status),
         code: null,
         detail: detail.slice(0, 500) || undefined,
       },

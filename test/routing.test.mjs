@@ -1752,6 +1752,132 @@ test("router preserves relay 429 and suppresses repeated native attempts per acc
   }
 });
 
+function nativeRelaySse(payload) {
+  const relayArguments = JSON.stringify({ payload });
+  const relayEvents = [
+    {
+      type: "response.output_item.added",
+      item: {
+        type: "function_call",
+        id: "fc_relay",
+        name: "relay_external_agent_payload",
+        arguments: "",
+      },
+    },
+    {
+      type: "response.function_call_arguments.done",
+      item_id: "fc_relay",
+      arguments: relayArguments,
+    },
+  ];
+  return `${relayEvents
+    .map((entry) => `event: ${entry.type}\ndata: ${JSON.stringify(entry)}\n\n`)
+    .join("")}data: [DONE]\n\n`;
+}
+
+function encryptedSubagentTurn(model = "grok-oauth/grok-4.6") {
+  return {
+    model,
+    stream: false,
+    input: [
+      {
+        type: "agent_message",
+        content: [
+          { type: "input_text", text: "Message Type: MESSAGE\nPayload:\n" },
+          { type: "encrypted_content", encrypted_content: "gAAAAA-retry-payload=" },
+        ],
+      },
+    ],
+  };
+}
+
+test("router retries a 429 native collaboration relay and still decrypts the payload", async () => {
+  let nativeHits = 0;
+  const native = await mockServer(async (_request, response) => {
+    nativeHits += 1;
+    if (nativeHits === 1) {
+      json(response, 429, { error: { message: "rate limited" } });
+      return;
+    }
+    const event = nativeRelaySse("Inspect /tmp/capture.png harshly.");
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(event);
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+    CODEX_ROUTER_NATIVE_RELAY_RETRY_DELAY_MS: "0",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CHATGPT_SESSION_TOKEN",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(encryptedSubagentTurn()),
+    });
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(nativeHits, 2);
+    assert.equal(gatewayRequests.length, 1);
+    const content = gatewayRequests[0].input[0].content;
+    assert.equal(content.some((part) => part.type === "encrypted_content"), false);
+    assert.equal(content.at(-1).text, "Inspect /tmp/capture.png harshly.");
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+  }
+});
+
+test("router reports a persistent native collaboration 429 as 429, not 502", async () => {
+  let nativeHits = 0;
+  const native = await mockServer(async (_request, response) => {
+    nativeHits += 1;
+    json(response, 429, { error: { message: "rate limited" } });
+  });
+  let gatewayRequests = 0;
+  const gateway = await mockServer(async (_request, response) => {
+    gatewayRequests += 1;
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+    CODEX_ROUTER_NATIVE_RELAY_RETRY_DELAY_MS: "0",
+  });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const response = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer expired-session",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(encryptedSubagentTurn()),
+    });
+    assert.equal(response.status, 429);
+    assert.ok(nativeHits >= 2, `expected retries, got ${nativeHits}`);
+    assert.equal(gatewayRequests, 0);
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+  }
+});
+
 test("router sends standalone image requests only to the native OpenAI backend", async () => {
   const nativeRequests = [];
   const native = await mockServer(async (request, response) => {
