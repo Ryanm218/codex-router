@@ -702,6 +702,46 @@ function objectBranches(schema, root, seen, depth = 0) {
   return branches;
 }
 
+// First-seen property merge used to keep `automation_update.mode` as
+// `const: "view"` from the view branch, so Grok never saw create/update/delete
+// and omitted `id` on view. Union string consts/enums (following local $refs)
+// so the flattened discriminator lists every branch value.
+function stringLiterals(schema, root, seen = new Set()) {
+  if (!isPlainObject(schema)) return undefined;
+  if (typeof schema.$ref === "string") {
+    if (seen.has(schema.$ref)) return undefined;
+    seen.add(schema.$ref);
+    return stringLiterals(resolveRef(schema.$ref, root), root, seen);
+  }
+  if (typeof schema.const === "string") return [schema.const];
+  if (
+    (schema.type === "string" || schema.type === undefined) &&
+    Array.isArray(schema.enum) &&
+    schema.enum.length > 0 &&
+    schema.enum.every((value) => typeof value === "string")
+  ) {
+    return schema.enum;
+  }
+  return undefined;
+}
+
+function mergeProperty(existing, incoming, root) {
+  if (isDeepStrictEqual(existing, incoming)) return existing;
+  const left = stringLiterals(existing, root);
+  const right = stringLiterals(incoming, root);
+  if (!left || !right) return existing;
+  const values = [...new Set([...left, ...right])];
+  if (values.length === 1 && isDeepStrictEqual(existing, { type: "string", const: values[0] })) {
+    return existing;
+  }
+  const next = { type: "string", enum: values };
+  const description = [existing, incoming]
+    .map((schema) => (isPlainObject(schema) ? schema.description : undefined))
+    .find((value) => typeof value === "string");
+  if (description) next.description = description;
+  return next;
+}
+
 const UNION_KEYWORDS = ["anyOf", "oneOf", "allOf"];
 
 function hasRootUnion(schema) {
@@ -767,6 +807,7 @@ export function objectRootToolSchema(schema) {
     if (!isPlainObject(branch.properties)) continue;
     for (const [name, property] of Object.entries(branch.properties)) {
       if (!(name in properties)) properties[name] = property;
+      else properties[name] = mergeProperty(properties[name], property, schema);
     }
   }
   // Required only where every branch requires it: a field the view branch
