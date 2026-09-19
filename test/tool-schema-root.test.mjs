@@ -375,6 +375,20 @@ test("flattened union properties lead with id when the field exists", () => {
     ],
   });
   assert.deepEqual(Object.keys(flattened.properties), ["id", "mode", "force"]);
+  assert.deepEqual(flattened.properties.mode, { type: "string", enum: ["view", "delete"] });
+});
+
+test("flattened automation_update mode is the union of branch modes, not const view", () => {
+  const automationUpdate = CODEX_APP_TOOLS.flatMap((entry) =>
+    entry.type === "namespace" ? entry.tools : [entry],
+  ).find((tool) => tool.name === "automation_update");
+  const flattened = objectRootToolSchema(automationUpdate.inputSchema);
+  assert.notEqual(flattened.properties.mode?.const, "view");
+  const modes = flattened.properties.mode?.enum;
+  assert.ok(Array.isArray(modes), "mode must be a merged string enum");
+  for (const mode of ["view", "create", "suggested_create", "update", "suggested_update", "delete"]) {
+    assert.ok(modes.includes(mode), `flattened mode is missing ${mode}`);
+  }
 });
 
 test("object-rooted schemas with id not first are rewritten to lead with id", () => {
@@ -421,6 +435,9 @@ test("Grok sees automation_update with id first", () => {
   assert.ok(tool, "automation_update is still sent to Grok");
   assert.equal(Object.keys(tool.parameters.properties)[0], "id");
   assert.ok(Object.keys(tool.parameters.properties).includes("mode"));
+  const modes = tool.parameters.properties.mode?.enum;
+  assert.ok(Array.isArray(modes) && modes.includes("update") && modes.includes("view"));
+  assert.notEqual(tool.parameters.properties.mode?.const, "view");
 });
 
 // Regression for #179: Moonshot rejects the whole request when an enum literal

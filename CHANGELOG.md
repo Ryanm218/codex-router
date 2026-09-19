@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- **Flattened `automation_update.mode` is the union of branch modes, not `const: "view"`.** First-seen property merge kept the view branch's discriminator, so Grok treated every call as view and omitted `id` (`expected string, received undefined`). String consts/enums now merge across branches (following local `$refs`). `id` still leads and stays optional for create.
+
 - **Grok OAuth chat streams no longer emit Responses `event: error` or empty-choice usage trailers.** LiteLLM translates this listener from Chat Completions to Responses and indexes `choices[0]` on every non-error chunk. A committed-head failure now writes `data: {"error":{message,type,code}}` and closes without `[DONE]`; usage rides on the finish-reason chunk. Direct `/v1/responses` to Codex still uses Responses `event: error`.
 
 - **Grok OAuth 4xx, native-relay 429, and empty-completion prelude no longer
