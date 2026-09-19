@@ -28,17 +28,43 @@ export function fetchDispatcherOptions() {
   };
 }
 
+function envNonNegativeInt(env, name, fallback) {
+  const parsed = Number(env?.[name]);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+}
+
+// The grok-oauth-forwarder is a single-origin process: it only POSTs to
+// cli-chat-proxy. Native Grok also forces HTTP/1.1, but it prewarms that
+// socket and keeps it. Codex turns are 30–60s apart, so Undici's 4s idle
+// default never reuses the connection. 60s is still under Cloudflare's
+// typical ~115s idle close. Do not copy this onto the shared router pool:
+// a half-closed POST there is UND_ERR_SOCKET with no retry.
+export const DEFAULT_GROK_UPSTREAM_KEEPALIVE_MS = 60_000;
+
+export function grokUpstreamDispatcherOptions(env = process.env) {
+  return {
+    allowH2: false,
+    pipelining: 1,
+    keepAliveTimeout: envNonNegativeInt(
+      env,
+      "CODEX_ROUTER_GROK_UPSTREAM_KEEPALIVE_MS",
+      DEFAULT_GROK_UPSTREAM_KEEPALIVE_MS,
+    ),
+  };
+}
+
 export function installStableFetchTransport({
   AgentClass = Agent,
   EnvHttpProxyAgentClass = EnvHttpProxyAgent,
   setDispatcher = setGlobalDispatcher,
   environment = process.env,
   execArgv = process.execArgv,
+  dispatcherOptions = fetchDispatcherOptions(),
 } = {}) {
   const DispatcherClass = environmentHttpProxyConfigured(environment, execArgv)
     ? EnvHttpProxyAgentClass
     : AgentClass;
-  const dispatcher = new DispatcherClass(fetchDispatcherOptions());
+  const dispatcher = new DispatcherClass(dispatcherOptions);
   setDispatcher(dispatcher);
   return dispatcher;
 }
