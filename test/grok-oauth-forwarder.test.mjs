@@ -1929,3 +1929,58 @@ test("keeps the first streamed answer when the retry also has no tools", async (
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+async function postGrokCompletion(backendHandler) {
+  const backend = await mockBackend(backendHandler);
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-status-"));
+  const child = startForwarder(port, backend.port, writeSession(dir));
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitHealth(base, child);
+    const resp = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        model: "grok-4.6",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    return {
+      status: resp.status,
+      body: await resp.json().catch(() => ({})),
+    };
+  } finally {
+    await stop(child);
+    await new Promise((r) => backend.server.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("preserves xAI 402 as HTTP 402 instead of collapsing it to 502", async () => {
+  const result = await postGrokCompletion((_req, res) => {
+    res.writeHead(402, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Grok Build usage balance exhausted" }));
+  });
+  assert.equal(result.status, 402);
+  assert.equal(result.body?.error?.type, "billing_error");
+  assert.match(String(result.body?.error?.detail || result.body?.error?.message || ""), /usage balance exhausted/i);
+});
+
+test("preserves xAI 400 as HTTP 400 instead of collapsing it to 502", async () => {
+  const result = await postGrokCompletion((_req, res) => {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Duplicate function definition provided" }));
+  });
+  assert.equal(result.status, 400);
+  assert.equal(result.body?.error?.type, "invalid_request_error");
+});
+
+test("still maps xAI 500 to HTTP 502", async () => {
+  const result = await postGrokCompletion((_req, res) => {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "internal" }));
+  });
+  assert.equal(result.status, 502);
+  assert.equal(result.body?.error?.type, "api_error");
+});

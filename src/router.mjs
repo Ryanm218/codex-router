@@ -56,6 +56,7 @@ import {
   EmptyCompletionTerminalGuard,
   isEmptyCompletionPreludeLimitError,
 } from "./empty-completion-guard.mjs";
+import { emptyCompletionPreludeMs } from "./empty-completion-prelude.mjs";
 import { itemLifecycleNormalizerTransform } from "./item-lifecycle-normalizer.mjs";
 import { reasoningTagStripperTransform } from "./reasoning-tag-stripper.mjs";
 import {
@@ -287,14 +288,6 @@ const ZERO_INPUT_ESTIMATE = process.env.CODEX_ROUTER_ZERO_INPUT_ESTIMATE !== "0"
 // turn it off without downgrading the router.
 const EMPTY_COMPLETION_RETRY =
   process.env.CODEX_ROUTER_EMPTY_COMPLETION_RETRY !== "0";
-const configuredEmptyCompletionPreludeMs = Number(
-  process.env.CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_MS || 30_000,
-);
-const EMPTY_COMPLETION_PRELUDE_MS =
-  Number.isFinite(configuredEmptyCompletionPreludeMs) &&
-  configuredEmptyCompletionPreludeMs >= 0
-    ? configuredEmptyCompletionPreludeMs
-    : 30_000;
 const configuredEmptyCompletionPreludeBytes = Number(
   process.env.CODEX_ROUTER_EMPTY_COMPLETION_PRELUDE_BYTES || 1024 * 1024,
 );
@@ -1624,6 +1617,20 @@ const nativeCatalogDriftCheckTimer = setInterval(
 );
 nativeCatalogDriftCheckTimer.unref?.();
 
+function nativeRelayRetryDelayMs(responseHeaders, env = process.env) {
+  const configured = Number(env.CODEX_ROUTER_NATIVE_RELAY_RETRY_DELAY_MS);
+  if (Number.isFinite(configured) && configured >= 0) return Math.floor(configured);
+  const retryAfter = Number(responseHeaders?.get?.("retry-after"));
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(Math.floor(retryAfter * 1_000), 5_000);
+  }
+  return 250;
+}
+
+function nativeRelayFailureStatus(status) {
+  return status === 429 ? 429 : 502;
+}
+
 async function relayEncryptedAgentPayloadOnce(
   item,
   cacheKey,
@@ -1655,21 +1662,45 @@ async function relayEncryptedAgentPayloadOnce(
     ],
     tool_choice: { type: "function", name: AGENT_PAYLOAD_RELAY_TOOL },
   };
-  const upstream = await fetch(nativeTarget("/responses", ""), {
-    method: "POST",
-    headers: { ...headers, Accept: "text/event-stream" },
-    body: JSON.stringify(body),
-    signal,
-  });
-  const bytes = await readResponseBody(upstream, {
-    maxBytes: 4 * 1024 * 1024,
-    signal,
-  });
+  const maxAttempts = 3;
+  let lastStatus = 502;
+  let bytes;
+  let upstream;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    upstream = await fetch(nativeTarget("/responses", ""), {
+      method: "POST",
+      headers: { ...headers, Accept: "text/event-stream" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    bytes = await readResponseBody(upstream, {
+      maxBytes: 4 * 1024 * 1024,
+      signal,
+    });
+    lastStatus = upstream.status;
+    if (upstream.ok) break;
+    const retryable = lastStatus === 429 || lastStatus === 503;
+    if (!retryable || attempt === maxAttempts) {
+      const error = new Error(
+        `Native collaboration payload relay failed with HTTP ${lastStatus}.`,
+      );
+      error.status = nativeRelayFailureStatus(lastStatus);
+      throw error;
+    }
+    const delayMs = nativeRelayRetryDelayMs(upstream.headers);
+    console.error(
+      `[codex-router] native collaboration relay retry ${attempt}/${maxAttempts - 1} ` +
+        `status=${lastStatus} delayMs=${delayMs}`,
+    );
+    if (delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
   if (!upstream.ok) {
     const error = new Error(
-      `Native collaboration payload relay failed with HTTP ${upstream.status}.`,
+      `Native collaboration payload relay failed with HTTP ${lastStatus}.`,
     );
-    error.status = 502;
+    error.status = nativeRelayFailureStatus(lastStatus);
     throw error;
   }
   if (bytes.length > 4 * 1024 * 1024) {
@@ -4234,7 +4265,7 @@ async function handleResponses(request, response, requestUrl) {
         route && !directResponses && EMPTY_COMPLETION_RETRY
           ? new EmptyCompletionGuard(contentType, {
               maxPreludeBytes: EMPTY_COMPLETION_PRELUDE_BYTES,
-              maxPreludeMs: EMPTY_COMPLETION_PRELUDE_MS,
+              maxPreludeMs: emptyCompletionPreludeMs(route?.provider),
             })
           : undefined;
       if (guard) {
