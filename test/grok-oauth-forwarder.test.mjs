@@ -97,6 +97,78 @@ function writeSession(dir) {
   return authPath;
 }
 
+function parseSseBlocks(body) {
+  return String(body)
+    .split(/\r?\n\r?\n/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+}
+
+function sseBlockFields(block) {
+  let eventType;
+  const dataLines = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (line.startsWith("event:")) eventType = line.slice(6).trim();
+    else if (line.startsWith("data:")) {
+      const value = line.slice(5);
+      dataLines.push(value.startsWith(" ") ? value.slice(1) : value);
+    }
+  }
+  return { eventType, data: dataLines.length ? dataLines.join("\n") : undefined };
+}
+
+function chatCompletionErrorFrames(body) {
+  const errors = [];
+  for (const block of parseSseBlocks(body)) {
+    const { data } = sseBlockFields(block);
+    if (!data || data === "[DONE]") continue;
+    let json;
+    try {
+      json = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (json?.error && typeof json.error === "object") errors.push(json.error);
+  }
+  return errors;
+}
+
+// LiteLLM's chat→Responses transformer does `choices[0]` on every non-error
+// chunk (streaming_iterator.py:_get_delta_string_from_streaming_choices).
+// A Responses-style `event: error` frame or a `choices: []` usage trailer
+// becomes IndexError and Codex sees "list index out of range".
+function assertLiteLlmChatToResponsesSafe(body) {
+  for (const block of parseSseBlocks(body)) {
+    const { eventType, data } = sseBlockFields(block);
+    assert.notEqual(
+      eventType,
+      "error",
+      "chat.completions streams must not emit Responses event: error frames",
+    );
+    if (!data || data === "[DONE]") continue;
+    const json = JSON.parse(data);
+    if (json.error) {
+      assert.equal(typeof json.error.message, "string");
+      assert.ok(json.error.message.length > 0);
+      continue;
+    }
+    const choice = json.choices[0];
+    assert.ok(choice, "LiteLLM indexes choices[0] on every non-error chat chunk");
+  }
+}
+
+function assertChatCompletionsStreamError(body, code) {
+  assert.equal((String(body).match(/^event:\s*error$/m) || []).length, 0);
+  const errors = chatCompletionErrorFrames(body);
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].code, code);
+  assert.equal(errors[0].type, "api_error");
+  assert.equal(typeof errors[0].message, "string");
+  assert.ok(errors[0].message.length > 0);
+  assert.doesNotMatch(body, /data: \[DONE\]/);
+  assertLiteLlmChatToResponsesSafe(body);
+}
+
 test("translates Chat Completions to Grok Responses and back (text + tools)", async () => {
   let captured;
   let capturedHeaders;
@@ -338,9 +410,7 @@ test("emits one terminal SSE error when the upstream stream fails mid-turn", asy
     });
     assert.equal(result.status, 200);
     assert.match(result.body, /"content":"partial"/);
-    assert.equal((result.body.match(/event: error/g) || []).length, 1);
-    assert.match(result.body, /local_router_stream_failed/);
-    assert.doesNotMatch(result.body, /data: \[DONE\]/);
+    assertChatCompletionsStreamError(result.body, "local_router_stream_failed");
     assert.match(
       child.testErrors(),
       /upstream-phase-failed=true phase=attempt model=grok-4\.6 attempt_req=[0-9a-f-]{36} attempt_headers_ms=\d+ attempt_first_event_ms=\d+ attempt_total_ms=\d+ error=(?:TypeError|AbortError)/,
@@ -383,6 +453,9 @@ test("streams xAI reasoning deltas as chat reasoning_content", async () => {
     assert.match(body, /"reasoning_content":"先想"/);
     assert.match(body, /"reasoning_content":"再想"/);
     assert.match(body, /"content":"答案"/);
+    assertLiteLlmChatToResponsesSafe(body);
+    assert.match(body, /"prompt_tokens":8/);
+    assert.match(body, /"completion_tokens":12/);
     const complete = await fetch(`${base}/v1/chat/completions`, {
       method: "POST",
       headers: auth,
@@ -1108,9 +1181,7 @@ test("buffers a proven progress-only prefix without losing a healthy short answe
     assert.equal(repeated.status, 200);
     assert.equal(inbound, 4);
     assert.doesNotMatch(body, /Next I will update the deck/);
-    assert.equal((body.match(/event: error/g) || []).length, 1);
-    assert.match(body, /local_router_stream_failed/);
-    assert.doesNotMatch(body, /data: \[DONE\]/);
+    assertChatCompletionsStreamError(body, "local_router_stream_failed");
   } finally {
     await stop(child);
     await new Promise((r) => backend.server.close(r));
@@ -1565,10 +1636,9 @@ test("double-empty after a tool result is an explicit terminal error, never a cl
       assert.equal(inbound, 2);
       if (stream) {
         assert.equal(resp.status, 200);
-        assert.equal((body.match(/event: error/g) || []).length, 1);
-        assert.match(body, /local_router_stream_failed/);
+        assertChatCompletionsStreamError(body, "progress_only_unrepairable");
         assert.match(body, /Grok stopped after a tool result/);
-        assert.doesNotMatch(body, /"finish_reason":"(?:stop|tool_calls)"|\[DONE\]/);
+        assert.doesNotMatch(body, /"finish_reason":"(?:stop|tool_calls)"/);
       } else {
         assert.equal(resp.status, 502);
         assert.match(body, /progress_only_unrepairable/);

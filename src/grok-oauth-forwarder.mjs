@@ -7,7 +7,6 @@ import { fileURLToPath } from "node:url";
 
 import {
   applyKeepAliveTimeouts,
-  endStreamedResponse,
   formatErrorChain,
   httpErrorStatus,
   installGracefulShutdown,
@@ -574,14 +573,37 @@ async function consumeResponsesStream(upstreamBody, handlers) {
   if (buffer.trim()) dispatchSseBlock(buffer, handlers);
 }
 
-const OPENAI_ROLE_CHUNK = (id, created, model, delta, finishReason = null) =>
-  `data: ${JSON.stringify({
+const OPENAI_ROLE_CHUNK = (id, created, model, delta, finishReason = null, usage = null) => {
+  const chunk = {
     id,
     object: "chat.completion.chunk",
     created,
     model,
     choices: [{ index: 0, delta, finish_reason: finishReason }],
-  })}\n\n`;
+  };
+  if (usage) chunk.usage = usage;
+  return `data: ${JSON.stringify(chunk)}\n\n`;
+};
+
+// LiteLLM consumes this listener as Chat Completions and translates to
+// Responses. A Responses `event: error` frame becomes a chunk with empty
+// choices, and LiteLLM's transformer then IndexErrors on choices[0].
+function endChatCompletionStream(response, { message, code } = {}) {
+  if (!response || response.writableEnded || response.destroyed) return;
+  const payload = {
+    error: {
+      message: message || "The Grok OAuth forwarder lost the upstream response stream.",
+      type: "api_error",
+      code: code || "local_router_stream_failed",
+    },
+  };
+  try {
+    response.write(`\n\ndata: ${JSON.stringify(payload)}\n\n`);
+  } catch {
+    // The socket may already be gone; end anyway.
+  }
+  response.end();
+}
 
 async function handleChatCompletions(request, response) {
   const chat = JSON.parse((await readRequestBody(request)).toString("utf8"));
@@ -915,7 +937,10 @@ async function handleChatCompletions(request, response) {
       `[grok-oauth] progress-only-unrepairable=true model=${model} code=${repairFailure.code} ${upstreamAttemptTiming("attempt", firstAttempt)} ${upstreamAttemptTiming("repair", repairAttempt)}`,
     );
     if (wantsStream && streamStarted) {
-      endStreamedResponse(response, { message: repairFailure.message });
+      endChatCompletionStream(response, {
+        message: repairFailure.message,
+        code: repairFailure.code,
+      });
       return;
     }
     writeJson(response, 502, {
@@ -945,12 +970,9 @@ async function handleChatCompletions(request, response) {
       }
       emittedDeltaCount = turn.deltas?.length || 0;
     }
-    response.write(OPENAI_ROLE_CHUNK(id, created, model, {}, turn.finishReason));
-    if (turn.usage) {
-      response.write(
-        `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage: turn.usage })}\n\n`,
-      );
-    }
+    response.write(
+      OPENAI_ROLE_CHUNK(id, created, model, {}, turn.finishReason, turn.usage || null),
+    );
     response.write("data: [DONE]\n\n");
     response.end();
   } else {
@@ -1023,7 +1045,7 @@ if (isMain) {
           },
         });
       } else if (!response.writableEnded) {
-        endStreamedResponse(response, {
+        endChatCompletionStream(response, {
           message: "The Grok OAuth forwarder lost the upstream response stream.",
         });
       }
