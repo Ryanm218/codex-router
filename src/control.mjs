@@ -1866,10 +1866,13 @@ async function handleFailover(action, ...rest) {
     readProviderCooldowns,
     setFailoverChain,
     setFailoverEnabled,
+    setFailoverNative,
   } = await import("./model-failover.mjs");
+  const { nativeSessionStatus } = await import("./codex-native-session.mjs");
   const snapshot = () => ({
     ...readFailoverSettings(),
     cooldowns: readProviderCooldowns(),
+    nativeSessionUsable: nativeSessionStatus().usable === true,
   });
   const desired = action || "status";
   if (desired === "status") {
@@ -1878,6 +1881,14 @@ async function handleFailover(action, ...rest) {
   }
   if (desired === "on" || desired === "off") {
     setFailoverEnabled(desired === "on");
+  } else if (desired === "native") {
+    const nativeAction = rest[0];
+    if (nativeAction !== "on" && nativeAction !== "off") {
+      throw new Error(
+        "Usage: control failover native on|off",
+      );
+    }
+    setFailoverNative(nativeAction === "on");
   } else if (desired === "chain") {
     setFailoverChain(rest);
   } else if (desired === "auto") {
@@ -1888,7 +1899,7 @@ async function handleFailover(action, ...rest) {
     clearAllProviderCooldowns();
   } else {
     throw new Error(
-      "Usage: control failover status|on|off|chain <model-slug,...>|auto|reset",
+      "Usage: control failover status|on|off|native on|off|chain <model-slug,...>|auto|reset",
     );
   }
   process.stdout.write(`${JSON.stringify(snapshot(), null, 2)}\n`);

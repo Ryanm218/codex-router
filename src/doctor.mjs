@@ -656,12 +656,15 @@ if (visionSettings.enabled && !visionEngine) {
 // answer here rather than in the log.
 const failoverSettings = readFailoverSettings();
 const activeCooldowns = Object.entries(readProviderCooldowns());
+const nativeHop = failoverSettings.native
+  ? "native ChatGPT hop on"
+  : "native ChatGPT hop off";
 if (!failoverSettings.enabled) {
   add(
     "ok",
     "Model failover",
-    "off -- a provider that runs out of usage ends the turn",
-    "Run ./bin/model-router codex control failover on to let a turn continue on another enabled model.",
+    `off -- a provider that runs out of usage ends the turn (${nativeHop})`,
+    "Run ./bin/model-router codex control failover on to let a turn continue on another enabled model. Native ChatGPT hop: ./bin/model-router codex control failover native on|off.",
   );
 } else if (activeCooldowns.length) {
   add(
@@ -669,7 +672,7 @@ if (!failoverSettings.enabled) {
     "Model failover",
     `holding off ${activeCooldowns
       .map(([id, entry]) => `${id} until ${entry.until} (${entry.reason || "reported empty"})`)
-      .join(", ")}`,
+      .join(", ")} (${nativeHop})`,
     "Each clears itself at that time, or on the provider's next successful answer. " +
       "Run ./bin/model-router codex control failover reset to clear them now.",
   );
@@ -677,8 +680,8 @@ if (!failoverSettings.enabled) {
   add(
     "ok",
     "Model failover",
-    `on, in the order you set: ${failoverSettings.chain.join(" -> ")}`,
-    "Run ./bin/model-router codex control failover auto to hand the order back to the ranking.",
+    `on, in the order you set: ${failoverSettings.chain.join(" -> ")} (${nativeHop})`,
+    "Run ./bin/model-router codex control failover auto to hand the order back to the ranking. Native ChatGPT hop: ./bin/model-router codex control failover native on|off.",
   );
 } else {
   // Count what the ranking can actually reach rather than restating the tier
@@ -692,11 +695,11 @@ if (!failoverSettings.enabled) {
     "ok",
     "Model failover",
     failoverCounts.free
-      ? `on, ${failoverCounts.free} free model(s) first then ${failoverCounts.subscription} model(s) on your own providers`
-      : `on, ${failoverCounts.subscription} model(s) on your own providers -- no free model is curated, so nothing cheaper is tried first`,
+      ? `on, ${failoverCounts.free} free model(s) first then ${failoverCounts.subscription} model(s) on your own providers (${nativeHop})`
+      : `on, ${failoverCounts.subscription} model(s) on your own providers -- no free model is curated, so nothing cheaper is tried first (${nativeHop})`,
     failoverCounts.free
-      ? "Run ./bin/model-router codex control failover chain <model-slug,...> to choose the order yourself."
-      : "Free catalogs change without notice so none are checked in. Run ./bin/model-router codex curate-models opencode-free to give failover a free first stop.",
+      ? "Run ./bin/model-router codex control failover chain <model-slug,...> to choose the order yourself. Native ChatGPT hop: ./bin/model-router codex control failover native on|off."
+      : "Free catalogs change without notice so none are checked in. Run ./bin/model-router codex curate-models opencode-free to give failover a free first stop. Native ChatGPT hop: ./bin/model-router codex control failover native on|off.",
   );
 }
 // The same list the catalog writes definitions from, so a model switched off

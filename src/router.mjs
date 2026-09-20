@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import http from "node:http";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
@@ -135,6 +135,7 @@ import {
   classifyRoutedFailure,
   clearProviderCooldown,
   providerCooldown,
+  nativeFailoverCandidateFromCatalog,
   rankFailoverCandidates,
   readFailoverSettings,
   recordProviderCooldown,
@@ -3314,7 +3315,29 @@ async function prepareRoutedRequest({
 // probes every provider's credential synchronously and spawns
 // `/usr/bin/security` per keychain service on macOS, which would cost every
 // healthy turn about 250ms of blocked event loop for nothing.
-function failoverCandidates({ route, agedInput, flattenedNamespaces, searchContract, chain }) {
+function readNativeCatalogModelsForFailover() {
+  if (!existsSync(NATIVE_CATALOG_PATH)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(NATIVE_CATALOG_PATH, "utf8"));
+    return Array.isArray(parsed?.models) ? parsed.models : [];
+  } catch {
+    return [];
+  }
+}
+
+function nativeFailoverCandidateForRequest(request) {
+  const settings = readFailoverSettings();
+  if (!settings.native) return undefined;
+  if (discoveryDisabled()) return undefined;
+  if (!request || callerBroughtNoUpstreamCredential(request)) return undefined;
+  if (!hasNativeSession(nativeHeaders(request))) return undefined;
+  return nativeFailoverCandidateFromCatalog({
+    models: readNativeCatalogModelsForFailover(),
+    hidden: readHiddenModels(),
+  });
+}
+
+function failoverCandidates({ route, agedInput, flattenedNamespaces, searchContract, chain, request }) {
   const hidden = readHiddenModels();
   return rankFailoverCandidates(
     selectedConfiguredListedModels().filter((model) => (
@@ -3336,8 +3359,60 @@ function failoverCandidates({ route, agedInput, flattenedNamespaces, searchContr
       hasSearchHistory: searchContract.hasSearchHistory,
       requiredSearchMode: searchContract.requiredMode,
       chain,
+      nativeCandidate: nativeFailoverCandidateForRequest(request),
     },
   );
+}
+
+async function prepareNativeFailoverRequest({ request, payload, model, requestUrl }) {
+  const native = { ...payload, model: model.slug };
+  const compactV1 = /\/responses\/compact$/.test(requestUrl.pathname);
+  const compactV2 =
+    Array.isArray(payload.input) &&
+    payload.input.at(-1)?.type === "compaction_trigger";
+  const variantBase = nativeContextVariantBase(native.model);
+  if (variantBase) native.model = variantBase;
+  normalizeNativePromptCacheCompatibility(native);
+  let toolResultAging;
+  if (Array.isArray(payload.input)) {
+    native.input = normalizeNativeInput(payload.input, {
+      statelessReasoning: false,
+      dropUnstoredReasoningReferences: false,
+    });
+    if (!compactV1 && !compactV2) {
+      const aged = ageToolResults(native.input, {
+        enabled: nativeToolResultAgingEnabled(),
+      });
+      native.input = aged.input;
+      toolResultAging = aged.stats;
+    }
+  }
+  const flattenedNamespaces = flattenNamespaceTools(payload.tools, {
+    bridgeToolSearch: false,
+  }).namespaces;
+  const pendingInterrupts = pendingInterruptTargets(native.input ?? payload.input, {
+    namespaces: flattenedNamespaces,
+  });
+  if (!compactV1) delete native.previous_response_id;
+  const headers = nativeHeaders(request);
+  const nativePortableBody = Buffer.from(JSON.stringify(native), "utf8");
+  if (!nativeBodyIsPortable(nativePortableBody)) {
+    const error = new Error("native failover body is not portable");
+    error.code = "native_failover_not_portable";
+    throw error;
+  }
+  const body = await compressedNativeBody(nativePortableBody, headers);
+  return {
+    target: nativeTarget(requestUrl.pathname),
+    headers,
+    body,
+    searchMode: "hosted",
+    namespacesFlattened: false,
+    flattenedNamespaces,
+    pendingInterrupts,
+    agedInput: native.input,
+    toolResultAging,
+  };
 }
 
 // Transport failover for a child turn is stricter than the general quota path:
@@ -3385,6 +3460,7 @@ function routedRequestFits(route, body) {
 
 function candidateBuildCompatibilityCode(error) {
   if (error?.code === "model_search_not_supported") return error.code;
+  if (error?.code === "native_failover_not_portable") return error.code;
   if (error?.code === GROQ_TOOL_LIMIT_CODE && error?.provider === "groq") return error.code;
   return undefined;
 }
@@ -3415,6 +3491,7 @@ function logFailover(from, to, reason, status, outcome) {
 // is the honest answer whenever no candidate can serve this conversation.
 async function attemptModelFailover({
   request,
+  requestUrl,
   response,
   payload,
   route,
@@ -3444,6 +3521,7 @@ async function attemptModelFailover({
         flattenedNamespaces,
         searchContract,
         chain: settings.chain,
+        request,
       }).slice(0, MAX_FAILOVER_HOPS);
   if (!candidates.length) {
     logFailover(route, undefined, verdict.reason, status, "no-candidate");
@@ -3462,13 +3540,22 @@ async function attemptModelFailover({
     let built;
     let upstream;
     try {
-      built = await prepareRoutedRequest({
-        request,
-        payload,
-        route: model,
-        normalizedInput,
-        agingEnabled,
-      });
+      if (model.native) {
+        built = await prepareNativeFailoverRequest({
+          request,
+          payload,
+          model,
+          requestUrl,
+        });
+      } else {
+        built = await prepareRoutedRequest({
+          request,
+          payload,
+          route: model,
+          normalizedInput,
+          agingEnabled,
+        });
+      }
       if (!routedRequestFits(model, built.body)) {
         logFailover(route, model, verdict.reason, status, "context-too-small");
         continue;
@@ -3502,7 +3589,7 @@ async function attemptModelFailover({
     }
     if (upstream.ok) {
       logFailover(route, model, verdict.reason, status, upstream.status);
-      return { route: model, built, upstream };
+      return { route: model, built, upstream, native: model.native === true };
     }
     // The candidate failed too. If it failed the same way, believe it and take
     // it out of the running for the next turn as well; anything else is that
@@ -3900,10 +3987,15 @@ async function handleResponses(request, response, requestUrl) {
           flattenedNamespaces,
           searchContract,
           chain: settings.chain,
+          request,
         }).slice(0, MAX_FAILOVER_HOPS);
         for (const next of candidates) {
           let candidate;
           try {
+            // Native ChatGPT is only legal after a qualifying routed failure,
+            // never as a preemptive cooled-until swap. That path would make a
+            // native 5xx look like the original provider's error.
+            if (next.model.native) continue;
             candidate = await prepareRoutedRequest({
               request,
               payload,
@@ -4098,6 +4190,7 @@ async function handleResponses(request, response, requestUrl) {
         recordProviderCooldown(route.provider, verdict);
         const moved = await attemptModelFailover({
           request,
+          requestUrl,
           response,
           payload,
           route,
@@ -4122,7 +4215,29 @@ async function handleResponses(request, response, requestUrl) {
             durationMs: Date.now() - startedAt,
             responseStartMs: upstreamLatencyMs,
           });
-          adoptRoute(moved.route, moved.built);
+          if (moved.native) {
+            failoverFrom ??= route.slug;
+            requestedModel = moved.route.slug;
+            namespacesFlattened = moved.built.namespacesFlattened;
+            flattenedNamespaces = moved.built.flattenedNamespaces;
+            pendingInterrupts = moved.built.pendingInterrupts;
+            agedInput = moved.built.agedInput;
+            toolResultAging = moved.built.toolResultAging;
+            target = moved.built.target;
+            headers = moved.built.headers;
+            routedBody = moved.built.body;
+            builtSearchMode = moved.built.searchMode;
+            activity.setRoute({
+              provider: "openai",
+              model: requestedModel,
+              ...activityMetadataFromHeaders(request.headers),
+            });
+            // Native bytes must take the native pipeline: a truthy `route`
+            // would restore flattened namespaces and run provider compat.
+            route = undefined;
+          } else {
+            adoptRoute(moved.route, moved.built);
+          }
           upstream = moved.upstream;
           upstreamStatus = upstream.status;
           failedBodyText = moved.failedBodyText;

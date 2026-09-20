@@ -17,6 +17,7 @@ const {
   clearProviderCooldown,
   failoverTier,
   failoverTierCounts,
+  nativeFailoverCandidateFromCatalog,
   providerCooldown,
   rankFailoverCandidates,
   readFailoverSettings,
@@ -24,6 +25,7 @@ const {
   recordProviderCooldown,
   setFailoverChain,
   setFailoverEnabled,
+  setFailoverNative,
 } = await import("../src/model-failover.mjs");
 
 const NOW = Date.parse("2026-08-15T12:00:00.000Z");
@@ -342,6 +344,21 @@ test("an unreadable cooldown document means nothing is cooled down", (t) => {
 
 const FROM = { slug: "zai-coding/glm-5.3", provider: "zai-coding", contextWindow: 1_048_576 };
 
+function nativeCandidate(extra = {}) {
+  return {
+    slug: "gpt-6-astra",
+    provider: "openai",
+    native: true,
+    priority: 1,
+    contextWindow: 272_000,
+    inputModalities: ["text", "image"],
+    searchTool: { mode: "hosted" },
+    multiAgentVersion: "v2",
+    ...extra,
+  };
+}
+
+
 function model(slug, provider, extra = {}) {
   return {
     slug,
@@ -600,6 +617,173 @@ test("failoverTier reads free from the registry rather than a name", () => {
   assert.equal(failoverTier(model("gone/removed", "gone")), FAILOVER_TIER.subscription);
 });
 
+test("failoverTier ranks a native ChatGPT candidate between free and paid", () => {
+  assert.equal(
+    failoverTier(nativeCandidate({ slug: "gpt-6-astra" })),
+    FAILOVER_TIER.native,
+  );
+});
+
+test("auto ranking splices a native ChatGPT candidate between free and paid", () => {
+  const ranked = rankFailoverCandidates(
+    [
+      model("kimi/k3", "kimi", { priority: 10 }),
+      model("opencode-free/big-pickle", "opencode-free", { priority: 90 }),
+    ],
+    { from: FROM, nativeCandidate: nativeCandidate() },
+  );
+  assert.deepEqual(
+    ranked.map((entry) => entry.model.slug),
+    ["opencode-free/big-pickle", "gpt-6-astra", "kimi/k3"],
+  );
+  assert.equal(ranked[0].tier, FAILOVER_TIER.free);
+  assert.equal(ranked[1].tier, FAILOVER_TIER.native);
+  assert.equal(ranked[2].tier, FAILOVER_TIER.subscription);
+});
+
+test("auto ranking omits native ChatGPT when no candidate is offered", () => {
+  const ranked = rankFailoverCandidates(
+    [model("kimi/k3", "kimi"), model("opencode-free/big-pickle", "opencode-free")],
+    { from: FROM },
+  );
+  assert.deepEqual(
+    ranked.map((entry) => entry.model.slug),
+    ["opencode-free/big-pickle", "kimi/k3"],
+  );
+});
+
+test("a named chain includes native ChatGPT only when the operator asked for it", () => {
+  const models = [
+    model("kimi/k3", "kimi"),
+    model("opencode-free/big-pickle", "opencode-free"),
+  ];
+  const without = rankFailoverCandidates(models, {
+    from: FROM,
+    nativeCandidate: nativeCandidate(),
+    chain: ["kimi/k3"],
+  });
+  assert.deepEqual(
+    without.map((entry) => entry.model.slug),
+    ["kimi/k3"],
+  );
+
+  const byAlias = rankFailoverCandidates(models, {
+    from: FROM,
+    nativeCandidate: nativeCandidate(),
+    chain: ["native/chatgpt", "kimi/k3"],
+  });
+  assert.deepEqual(
+    byAlias.map((entry) => entry.model.slug),
+    ["gpt-6-astra", "kimi/k3"],
+  );
+
+  const bySlug = rankFailoverCandidates(models, {
+    from: FROM,
+    nativeCandidate: nativeCandidate(),
+    chain: ["gpt-6-astra"],
+  });
+  assert.deepEqual(
+    bySlug.map((entry) => entry.model.slug),
+    ["gpt-6-astra"],
+  );
+});
+
+test("native ChatGPT is skipped when it cannot hold the conversation", () => {
+  const ranked = rankFailoverCandidates(
+    [model("kimi/k3", "kimi", { contextWindow: 1_000_000 })],
+    {
+      from: FROM,
+      estimatedTokens: 300_000,
+      nativeCandidate: nativeCandidate({ contextWindow: 272_000 }),
+    },
+  );
+  assert.deepEqual(
+    ranked.map((entry) => entry.model.slug),
+    ["kimi/k3"],
+  );
+});
+
+test("native ChatGPT preserves hosted search and is skipped when it cannot", () => {
+  const hosted = rankFailoverCandidates([model("kimi/k3", "kimi")], {
+    from: { ...FROM, searchTool: { mode: "hosted" } },
+    needsSearch: true,
+    nativeCandidate: nativeCandidate({ searchTool: { mode: "hosted" } }),
+  });
+  assert.deepEqual(
+    hosted.map((entry) => entry.model.slug),
+    ["gpt-6-astra"],
+  );
+
+  const standalone = rankFailoverCandidates(
+    [model("kimi/k3", "kimi", { searchTool: { mode: "standalone" } })],
+    {
+      from: { ...FROM, searchTool: { mode: "standalone" } },
+      needsSearch: true,
+      nativeCandidate: nativeCandidate({ searchTool: { mode: "hosted" } }),
+    },
+  );
+  assert.deepEqual(
+    standalone.map((entry) => entry.model.slug),
+    ["kimi/k3"],
+  );
+});
+
+test("nativeFailoverCandidateFromCatalog picks the highest-priority listed native model", () => {
+  const candidate = nativeFailoverCandidateFromCatalog({
+    models: [
+      {
+        slug: "gpt-reserve",
+        visibility: "hide",
+        priority: 0,
+        context_window: 272_000,
+        input_modalities: ["text", "image"],
+        multi_agent_version: "v1",
+      },
+      {
+        slug: "gpt-5.6-sol",
+        visibility: "list",
+        priority: 6,
+        context_window: 272_000,
+        input_modalities: ["text", "image"],
+        multi_agent_version: "v2",
+      },
+      {
+        slug: "gpt-6-astra",
+        visibility: "list",
+        priority: 1,
+        context_window: 272_000,
+        input_modalities: ["text", "image"],
+        multi_agent_version: "v2",
+      },
+    ],
+    hidden: new Set(),
+  });
+  assert.equal(candidate.slug, "gpt-6-astra");
+  assert.equal(candidate.native, true);
+  assert.equal(candidate.provider, "openai");
+  assert.equal(candidate.contextWindow, 272_000);
+  assert.deepEqual(candidate.searchTool, { mode: "hosted" });
+  assert.deepEqual(candidate.inputModalities, ["text", "image"]);
+  assert.equal(candidate.multiAgentVersion, "v2");
+});
+
+test("nativeFailoverCandidateFromCatalog skips hidden picker entries", () => {
+  assert.equal(
+    nativeFailoverCandidateFromCatalog({
+      models: [
+        {
+          slug: "gpt-6-astra",
+          visibility: "list",
+          priority: 1,
+          context_window: 272_000,
+        },
+      ],
+      hidden: new Set(["gpt-6-astra"]),
+    }),
+    undefined,
+  );
+});
+
 test("a model on this machine is never chosen automatically, but can be named", () => {
   const auto = rankFailoverCandidates(
     [model("local/qwen3", "local"), model("kimi/k3", "kimi")],
@@ -642,4 +826,41 @@ test("setFailoverChain accepts comma-separated slugs and auto clears it", () => 
     "c/three",
   ]);
   assert.deepEqual(setFailoverChain([]).chain, []);
+});
+
+test("native ChatGPT failover is off until an operator turns it on", () => {
+  assert.equal(readFailoverSettings().native, false);
+});
+
+test("an unreadable failover file does not enable the native hop", () => {
+  writeFileSync(path.join(stateDir, "failover.json"), "{not json", "utf8");
+  assert.equal(readFailoverSettings().native, false);
+  assert.equal(readFailoverSettings().enabled, false);
+  setFailoverEnabled(true);
+});
+
+test("a failover file written before the native flag stays off", () => {
+  writeFileSync(
+    path.join(stateDir, "failover.json"),
+    JSON.stringify({ version: 1, enabled: true, chain: ["kimi/k3"] }),
+    "utf8",
+  );
+  const settings = readFailoverSettings();
+  assert.equal(settings.enabled, true);
+  assert.deepEqual(settings.chain, ["kimi/k3"]);
+  assert.equal(settings.native, false);
+});
+
+test("setFailoverNative is remembered and survives enable and chain writes", () => {
+  const on = setFailoverNative(true);
+  assert.equal(on.native, true);
+  assert.equal(readFailoverSettings().native, true);
+  assert.equal(setFailoverEnabled(false).native, true);
+  assert.equal(readFailoverSettings().enabled, false);
+  assert.equal(setFailoverChain(["kimi/k3"]).native, true);
+  assert.deepEqual(readFailoverSettings().chain, ["kimi/k3"]);
+  assert.equal(setFailoverNative(false).native, false);
+  assert.equal(readFailoverSettings().native, false);
+  assert.equal(readFailoverSettings().enabled, false);
+  assert.deepEqual(readFailoverSettings().chain, ["kimi/k3"]);
 });
