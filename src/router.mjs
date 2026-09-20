@@ -64,6 +64,7 @@ import {
   zaiResponsesCompatTransform,
 } from "./zai-responses-compat.mjs";
 import { grokReasoningSummaryCompatTransform } from "./grok-reasoning-summary-compat.mjs";
+import { agentPhaseCompatTransform } from "./agent-phase-compat.mjs";
 import { translatedToolMessageCompatTransform } from "./deepseek-tool-message-compat.mjs";
 import { exactRouteProbeRequested } from "./exact-route-probe.mjs";
 import {
@@ -4287,13 +4288,19 @@ async function handleResponses(request, response, requestUrl) {
       // Restore sequential output-item lifecycles for routed providers, whose
       // chat-completions -> Responses bridge can leave an assistant `message`
       // item open across a `function_call` item and close it late, making Codex
-      // render the same turn's text twice. Runs last so it normalizes the final
-      // egress stream after every other rewrite/injection. Native OpenAI streams
-      // (no route) are already well-formed and left untouched.
+      // render the same turn's text twice. Native OpenAI streams (no route) are
+      // already well-formed and left untouched.
       const itemNormalizer = route
         ? itemLifecycleNormalizerTransform(contentType)
         : undefined;
       if (itemNormalizer) transforms.push(itemNormalizer);
+      // Chat-completions bridges omit Codex `message.phase`. Tag in-flight
+      // notes `commentary` and the last no-tool message `final_answer` so
+      // Desktop can fold them under "Worked for". Already-phased items,
+      // including native OpenAI, pass through unchanged. Runs after the
+      // lifecycle normalizer so routed streams are sequential first.
+      const agentPhaseCompat = agentPhaseCompatTransform(contentType);
+      if (agentPhaseCompat) transforms.push(agentPhaseCompat);
       return { transforms, usageObserver, guard };
     };
     const firstPipeline = createResponsePipeline(upstreamContentType);
