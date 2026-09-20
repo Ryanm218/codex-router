@@ -194,6 +194,8 @@ function run(
   {
     chain = [FALLBACK.slug],
     enabled = true,
+    native = false,
+    nativeCatalog,
     cooldowns,
     toolResultAging = false,
     userModels,
@@ -206,7 +208,14 @@ function run(
   if (chain !== null) {
     writeFileSync(
       path.join(stateDir, "failover.json"),
-      JSON.stringify({ version: 1, enabled, chain }),
+      JSON.stringify({ version: 1, enabled, chain, native: native === true }),
+      "utf8",
+    );
+  }
+  if (nativeCatalog) {
+    writeFileSync(
+      path.join(stateDir, "native-models.json"),
+      JSON.stringify({ models: nativeCatalog }),
       "utf8",
     );
   }
