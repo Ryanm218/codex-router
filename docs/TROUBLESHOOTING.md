@@ -384,8 +384,13 @@ pay for it. After a tool result, every no-tool prose response is held and
 repaired once — no language match, token floor, or length threshold. The
 repair must call exactly one function: either a client tool or the private
 router final-answer tool. The latter is converted to ordinary assistant text
-and never reaches Codex. A retry that does neither returns an explicit 502; it
-is never converted into a clean `stop`. After a user message the older rule
+and never reaches Codex. A retry that does neither is never converted into a
+clean `stop`: non-stream returns HTTP 502 `progress_only_unrepairable`; a
+stream whose head is already sent writes a Chat Completions
+`data: {"error":{...}}` frame with that code and closes without `[DONE]`.
+Do not emit Responses `event: error` on this listener — LiteLLM's
+chat→Responses transform IndexErrors on empty `choices` and Codex sees
+"list index out of range". After a user message the older rule
 remains: both a finished one-liner and a stalled plan retry when output tokens
 clear the floor, and the nudge offers the no-tool branch first so "Yes, that
 is correct." is not talked into a call the client would then run. Raise

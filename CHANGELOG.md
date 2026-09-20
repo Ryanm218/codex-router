@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **Grok OAuth chat streams no longer emit Responses `event: error` or empty-choice usage trailers.** LiteLLM translates this listener from Chat Completions to Responses and indexes `choices[0]` on every non-error chunk. A committed-head failure now writes `data: {"error":{message,type,code}}` and closes without `[DONE]`; usage rides on the finish-reason chunk. Direct `/v1/responses` to Codex still uses Responses `event: error`.
 - **An apostrophe in a harness config no longer moves the router's route into
   somebody else's value.** `yaml-structure.mjs` treated every `'` and `"` as a
   quoting indicator, but YAML only gives a quote that meaning where a node can
