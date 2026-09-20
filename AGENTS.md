@@ -2040,13 +2040,16 @@ purpose; several of them exist because the obvious wider version is wrong.
     including that the failed attempt's bytes never reach the client). A change
     to the trigger set, the ranking, or the cooldown rules needs a test there.
 
-**Not implemented: the native ChatGPT tier.** Falling back to the signed-in
-ChatGPT plan is deliberately absent. It is not a body swap but the other branch
-entirely, and it crosses the routed/native boundary this file governs
-elsewhere — `encrypted_content` rewriting, the compatibility relay, the
-collaboration envelope. Those rules require live marker-return probes through
-every installed routed agent before a change ships, so the tier cannot be added
-from the test suite alone. Add it with those proofs or not at all.
+**Native ChatGPT failover is opt-in.** A routed quota/rate-limit miss may be
+rebuilt once for the signed-in ChatGPT Codex backend when `failover.json`
+has `native: true`. Default is off; a missing or unreadable file stays off.
+The hop uses the caller's live ChatGPT session (`nativeHeaders`), never the
+router caller key, and never a substituted Cursor/Claude/Gemini caller.
+It is ranked at `FAILOVER_TIER.native` (after free, before other
+subscriptions). Compaction and subagent transport stay routed. A native 2xx
+is served as native bytes: no LiteLLM / Z.ai / Grok-compat transforms.
+`control failover native on|off` writes the flag. Ryan's install is switched
+on as an operator setting, not a source default.
 
 ## A completed function_call must carry parseable JSON arguments
 

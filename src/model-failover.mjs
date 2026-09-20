@@ -305,7 +305,7 @@ export function clearAllProviderCooldowns() {
 // -- the operator's answer ---------------------------------------------------
 
 function defaultSettings() {
-  return { version: 1, enabled: true, chain: [], defaulted: true };
+  return { version: 1, enabled: true, chain: [], native: false, defaulted: true };
 }
 
 // A file exists, so somebody was here, but this build cannot tell what they
@@ -313,7 +313,7 @@ function defaultSettings() {
 // `bin/control failover on` is one command away. Same reasoning as the vision
 // bridge's `disabledSettings()`.
 function unreadableSettings() {
-  return { version: 1, enabled: false, chain: [] };
+  return { version: 1, enabled: false, chain: [], native: false };
 }
 
 export function readFailoverSettings() {
@@ -327,6 +327,9 @@ export function readFailoverSettings() {
         chain: Array.isArray(parsed.chain)
           ? parsed.chain.map((slug) => String(slug).trim()).filter(Boolean)
           : [],
+        // Absent on older files on purpose: a missing field must not start
+        // spending the signed-in ChatGPT plan.
+        native: parsed.native === true,
       };
     }
   } catch {
@@ -337,7 +340,12 @@ export function readFailoverSettings() {
 
 export function setFailoverEnabled(enabled) {
   const current = readFailoverSettings();
-  const next = { version: 1, enabled: enabled === true, chain: current.chain };
+  const next = {
+    version: 1,
+    enabled: enabled === true,
+    chain: current.chain,
+    native: current.native === true,
+  };
   writePrivateJson(FAILOVER_STATE_PATH, next, { directoryMode: 0o700 });
   return next;
 }
@@ -351,7 +359,24 @@ export function setFailoverChain(slugs) {
     .flatMap((value) => String(value).split(","))
     .map((value) => value.trim())
     .filter(Boolean);
-  const next = { version: 1, enabled: current.enabled, chain };
+  const next = {
+    version: 1,
+    enabled: current.enabled,
+    chain,
+    native: current.native === true,
+  };
+  writePrivateJson(FAILOVER_STATE_PATH, next, { directoryMode: 0o700 });
+  return next;
+}
+
+export function setFailoverNative(enabled) {
+  const current = readFailoverSettings();
+  const next = {
+    version: 1,
+    enabled: current.enabled,
+    chain: current.chain,
+    native: enabled === true,
+  };
   writePrivateJson(FAILOVER_STATE_PATH, next, { directoryMode: 0o700 });
   return next;
 }
@@ -359,10 +384,45 @@ export function setFailoverChain(slugs) {
 // -- which candidates are eligible -------------------------------------------
 
 export function failoverTier(model, providers = PROVIDERS) {
+  if (model?.native === true) return FAILOVER_TIER.native;
   const provider = providers.get(model?.provider);
   return provider?.keyless || provider?.authMode === "anonymous"
     ? FAILOVER_TIER.free
     : FAILOVER_TIER.subscription;
+}
+
+// The signed-in ChatGPT plan is not a registry model. Pick the highest-priority
+// listed native slug the picker would actually show, and shape it like a
+// failover candidate so ranking and the hop share one object.
+export function nativeFailoverCandidateFromCatalog({ models, hidden } = {}) {
+  const hiddenSet = hidden instanceof Set ? hidden : new Set(hidden || []);
+  const listed = (Array.isArray(models) ? models : [])
+    .filter((model) => (
+      model?.slug &&
+      model.visibility === "list" &&
+      !hiddenSet.has(model.slug)
+    ))
+    .sort((left, right) =>
+      Number(left.priority ?? 999) - Number(right.priority ?? 999) ||
+      String(left.slug).localeCompare(String(right.slug)),
+    );
+  const model = listed[0];
+  if (!model) return undefined;
+  return {
+    slug: String(model.slug),
+    provider: "openai",
+    native: true,
+    priority: Number.isFinite(model.priority) ? model.priority : 1,
+    contextWindow: Number.isFinite(model.context_window) ? model.context_window : undefined,
+    inputModalities: Array.isArray(model.input_modalities) ? model.input_modalities : ["text"],
+    searchTool: { mode: "hosted" },
+    multiAgentVersion: model.multi_agent_version || "v1",
+  };
+}
+
+function nativeChainAliases(model) {
+  if (!model?.slug) return [];
+  return [model.slug, "native/chatgpt"];
 }
 
 // What the ranking will actually be able to do, counted rather than promised.
@@ -463,6 +523,7 @@ export function rankFailoverCandidates(
     chain = [],
     now,
     allowSameFamily = false,
+    nativeCandidate,
   } = options;
   const fromProvider = canonicalProviderId(from?.provider || "");
   // An explicitly captured absence is part of the request contract. `??`
@@ -474,6 +535,15 @@ export function rankFailoverCandidates(
       ? routedModelSearchMode(from)
       : undefined;
   const cooled = new Set(Object.keys(readProviderCooldowns({ now })));
+  const eligibility = {
+    fromProvider,
+    estimatedTokens,
+    needsImage,
+    needsMultiAgentV2,
+    requiredSearchMode,
+    hasSearchHistory,
+    cooled,
+  };
   const available = (Array.isArray(models) ? models : []).filter(
     (model) =>
       model.slug !== from?.slug &&
@@ -488,27 +558,40 @@ export function rankFailoverCandidates(
         allowSameFamily,
       }),
   );
+  const nativeEligible =
+    nativeCandidate?.native === true &&
+    nativeCandidate.slug &&
+    nativeCandidate.slug !== from?.slug &&
+    eligible(nativeCandidate, eligibility);
 
   if (chain.length) {
     const bySlug = new Map(available.map((model) => [model.slug, model]));
+    if (nativeEligible) {
+      for (const alias of nativeChainAliases(nativeCandidate)) {
+        bySlug.set(alias, nativeCandidate);
+      }
+    }
     return chain
       .map((slug) => bySlug.get(slug))
       .filter(Boolean)
       .map((model) => ({ tier: failoverTier(model), model }));
   }
 
-  return available
+  const ranked = available
     // A model served from this machine is free and private, and it is still
     // never chosen automatically: the runtime might not be running, and a
     // failover that lands on a dead localhost has turned an honest quota error
     // into a connection error. Same rule the vision bridge applies to its own
     // local engine -- name one in the chain and it is used.
     .filter((model) => !PROVIDERS.get(model.provider)?.keyless)
-    .map((model) => ({ tier: failoverTier(model), model }))
-    .sort(
-      (left, right) =>
-        left.tier - right.tier ||
-        Number(left.model.priority ?? 999) - Number(right.model.priority ?? 999) ||
-        String(left.model.slug).localeCompare(String(right.model.slug)),
-    );
+    .map((model) => ({ tier: failoverTier(model), model }));
+  if (nativeEligible) {
+    ranked.push({ tier: FAILOVER_TIER.native, model: nativeCandidate });
+  }
+  return ranked.sort(
+    (left, right) =>
+      left.tier - right.tier ||
+      Number(left.model.priority ?? 999) - Number(right.model.priority ?? 999) ||
+      String(left.model.slug).localeCompare(String(right.model.slug)),
+  );
 }

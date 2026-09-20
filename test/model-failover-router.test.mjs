@@ -2260,3 +2260,172 @@ test("compact overflow without a larger window is a translated context error", a
     await closeServer(gw.server);
   }
 });
+
+const NATIVE_SESSION_TOKEN = "test-native-session-token";
+const NATIVE_ACCOUNT_ID = "test-native-account";
+const NATIVE_CATALOG = [
+  {
+    slug: "gpt-6-astra",
+    visibility: "list",
+    priority: 1,
+    context_window: 272_000,
+    input_modalities: ["text", "image"],
+    multi_agent_version: "v2",
+  },
+];
+
+function writeNativeAuth(stateDir) {
+  const authPath = path.join(stateDir, "codex-auth.json");
+  writeFileSync(
+    authPath,
+    JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: {
+        access_token: NATIVE_SESSION_TOKEN,
+        account_id: NATIVE_ACCOUNT_ID,
+      },
+    }),
+    { mode: 0o600 },
+  );
+  return authPath;
+}
+
+function nativeFailoverEnv(gatewayPort, routerPort, nativePort, authPath) {
+  return {
+    ...routerEnv(gatewayPort, routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
+    MODEL_ROUTER_CODEX_AUTH: authPath,
+  };
+}
+
+async function nativeQuotaHop({ nativeStatus = 200, session = true, nativeEnabled = true } = {}) {
+  const nativeSeen = [];
+  const gatewaySeen = [];
+  const native = await mockServer(async (request, response) => {
+    nativeSeen.push({
+      url: request.url,
+      headers: request.headers,
+      body: await bodyJson(request),
+    });
+    if (nativeStatus === 200) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(contentSse("native"));
+      return;
+    }
+    const payload = Buffer.from(JSON.stringify({ error: { message: "native failed" } }), "utf8");
+    response.writeHead(nativeStatus, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    gatewaySeen.push(body);
+    const payload = Buffer.from(QUOTA_BODY, "utf8");
+    response.writeHead(429, {
+      "Content-Type": "application/json",
+      "Content-Length": String(payload.length),
+    });
+    response.end(payload);
+  });
+  const routerPort = await openPort();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-failover-native-auth-"));
+  const authPath = writeNativeAuth(stateDir);
+  const child = run(nativeFailoverEnv(gw.port, routerPort, native.port, authPath), {
+    enabled: true,
+    native: nativeEnabled,
+    // Named so a native miss cannot fall through onto zai-api, which this
+    // harness always credentials. Production with an empty chain still splices
+    // native by auto rank; that is covered in the unit file.
+    chain: ["native/chatgpt"],
+    nativeCatalog: NATIVE_CATALOG,
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY, {
+      headers: session
+        ? {
+            Authorization: `Bearer ${NATIVE_SESSION_TOKEN}`,
+            "chatgpt-account-id": NATIVE_ACCOUNT_ID,
+          }
+        : {
+            // The harness authenticates in the path. A router-local bearer
+            // means this caller brought no ChatGPT session of its own.
+            Authorization: `Bearer ${CALLER_KEY}`,
+          },
+    });
+    return { result, nativeSeen, gatewaySeen, child, native, gw };
+  } catch (error) {
+    await stopChild(child);
+    await Promise.all([closeServer(native.server), closeServer(gw.server)]);
+    throw error;
+  }
+}
+
+test("a routed quota miss is served by the signed-in native ChatGPT plan", async () => {
+  const hop = await nativeQuotaHop();
+  try {
+    assert.equal(hop.gatewaySeen.length, 1);
+    assert.equal(hop.nativeSeen.length, 1);
+    assert.equal(hop.nativeSeen[0].url, "/backend-api/codex/responses");
+    assert.equal(hop.nativeSeen[0].body.model, "gpt-6-astra");
+    assert.equal(hop.nativeSeen[0].headers.authorization, `Bearer ${NATIVE_SESSION_TOKEN}`);
+    assert.equal(hop.nativeSeen[0].headers["chatgpt-account-id"], NATIVE_ACCOUNT_ID);
+    assert.equal(hop.result.status, 200);
+    assert.match(hop.result.body, /answered-by-native/);
+    assert.doesNotMatch(hop.result.body, /exceeded your current quota/);
+    const events = await waitForUsageEvents(hop.child.stateDir, 2, hop.child);
+    const failed = events.find((event) => event.model === PRIMARY.slug);
+    const served = events.find((event) => event.model === "gpt-6-astra");
+    assert.equal(failed.status, 429);
+    assert.equal(served.status, 200);
+    assert.equal(served.failoverFrom, PRIMARY.slug);
+    assert.equal(served.provider, "openai");
+    assert.match(hop.child.testErrors(), /failover model=deepseek\/deepseek-v4-pro/);
+    assert.match(hop.child.testErrors(), /reason=out_of_usage/);
+    assert.match(hop.child.testErrors(), /-> gpt-6-astra outcome=200/);
+  } finally {
+    await stopChild(hop.child);
+    await Promise.all([closeServer(hop.native.server), closeServer(hop.gw.server)]);
+  }
+});
+
+test("a substituted caller keeps the routed quota body instead of spending ChatGPT", async () => {
+  const hop = await nativeQuotaHop({ session: false });
+  try {
+    assert.equal(hop.nativeSeen.length, 0);
+    assert.equal(hop.result.status, 429);
+    assert.match(hop.result.body, /exceeded your current quota/);
+    assert.doesNotMatch(hop.result.body, /answered-by-native/);
+  } finally {
+    await stopChild(hop.child);
+    await Promise.all([closeServer(hop.native.server), closeServer(hop.gw.server)]);
+  }
+});
+
+test("a native ChatGPT hop that fails keeps the original routed quota body", async () => {
+  const hop = await nativeQuotaHop({ nativeStatus: 500 });
+  try {
+    assert.equal(hop.nativeSeen.length, 1);
+    assert.equal(hop.result.status, 429);
+    assert.match(hop.result.body, /exceeded your current quota/);
+    assert.doesNotMatch(hop.result.body, /answered-by-native/);
+    assert.match(hop.child.testErrors(), /-> gpt-6-astra outcome=500/);
+  } finally {
+    await stopChild(hop.child);
+    await Promise.all([closeServer(hop.native.server), closeServer(hop.gw.server)]);
+  }
+});
+
+test("native ChatGPT failover stays off until the operator turns it on", async () => {
+  const hop = await nativeQuotaHop({ nativeEnabled: false });
+  try {
+    assert.equal(hop.nativeSeen.length, 0);
+    assert.equal(hop.result.status, 429);
+    assert.match(hop.result.body, /exceeded your current quota/);
+  } finally {
+    await stopChild(hop.child);
+    await Promise.all([closeServer(hop.native.server), closeServer(hop.gw.server)]);
+  }
+});
