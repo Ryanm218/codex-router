@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_GROK_REPAIR_IDLE_MS,
   DEFAULT_GROK_STREAM_STALL_MS,
   grokGatewayStreamTimeoutSeconds,
+  grokRepairIdleMs,
   grokStreamStallMs,
   grokTransportIdleTimeoutMs,
 } from "../src/grok-stream-timeouts.mjs";
@@ -20,6 +22,22 @@ test("the Grok stall bound accepts only a positive, timer-safe value", () => {
       value,
     );
   }
+});
+
+test("the Grok repair idle is 120s unless explicitly disabled", () => {
+  assert.equal(DEFAULT_GROK_REPAIR_IDLE_MS, 120_000);
+  assert.equal(grokRepairIdleMs({}), 120_000);
+  assert.equal(grokRepairIdleMs({ CODEX_ROUTER_GROK_REPAIR_IDLE_MS: "45000" }), 45_000);
+  assert.equal(grokRepairIdleMs({ CODEX_ROUTER_GROK_REPAIR_IDLE_MS: "0" }), 0);
+  for (const value of ["", "-1", "abc", "Infinity", "3000000000"]) {
+    assert.equal(
+      grokRepairIdleMs({ CODEX_ROUTER_GROK_REPAIR_IDLE_MS: value }),
+      120_000,
+      value,
+    );
+  }
+  // The repair idle must not pull the primary-attempt transport down with it.
+  assert.equal(grokTransportIdleTimeoutMs({ CODEX_ROUTER_GROK_REPAIR_IDLE_MS: "1000" }), 660_000);
 });
 
 test("every Grok transport bound outlasts the stall guard and never shortens a hop", () => {

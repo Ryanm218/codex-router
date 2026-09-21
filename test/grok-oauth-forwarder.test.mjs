@@ -2708,6 +2708,252 @@ test("a second pre-header failure is not retried again", async () => {
   }
 });
 
+test("a silent repair ends on the repair idle instead of the stream stall", async () => {
+  let inbound = 0;
+  let held;
+  const backend = await mockBackend(async (_req, res) => {
+    inbound += 1;
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    if (inbound === 1) {
+      res.end(sse([
+        { type: "response.output_text.delta", delta: "Status only." },
+        { type: "response.completed", response: { usage: { input_tokens: 100, output_tokens: 500 } } },
+      ]));
+      return;
+    }
+    res.flushHeaders();
+    res.write(sse([{ type: "response.reasoning_summary_text.delta", delta: "repair-opened" }]));
+    held = res;
+    await new Promise((resolve) => res.once("close", resolve));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-repair-idle-"));
+  const child = startForwarder(port, backend.port, writeSession(dir), {
+    CODEX_ROUTER_GROK_REPAIR_IDLE_MS: "200",
+  });
+  const base = `http://127.0.0.1:${port}`;
+  const within = async (promise, message) => {
+    let timeout;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(message)), 2_000); }),
+      ]);
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+  try {
+    await waitHealth(base, child);
+    const resp = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        model: "grok-4.7",
+        messages: [
+          { role: "assistant", tool_calls: [{ id: "c1", type: "function", function: { name: "exec_command", arguments: "{}" } }] },
+          { role: "tool", tool_call_id: "c1", content: "tool output" },
+        ],
+        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
+        stream: true,
+      }),
+    });
+    assert.equal(resp.status, 200);
+    const body = await within(resp.text(), "silent strict repair was still open when the idle deadline passed");
+    assert.equal(inbound, 2);
+    assertChatCompletionsStreamError(body, "grok_repair_idle");
+    assert.doesNotMatch(body, /Status only\.|\[DONE\]|exec_command/);
+    await waitChildError(child, /repair-idle=true/);
+  } finally {
+    held?.destroy();
+    await stop(child);
+    await new Promise((r) => backend.server.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a silent optional repair keeps the first answer when the idle fires", async () => {
+  let inbound = 0;
+  let held;
+  const backend = await mockBackend(async (_req, res) => {
+    inbound += 1;
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    if (inbound === 1) {
+      res.end(sse([
+        { type: "response.output_text.delta", delta: "Short plan." },
+        { type: "response.completed", response: { usage: { input_tokens: 80, output_tokens: 500 } } },
+      ]));
+      return;
+    }
+    res.flushHeaders();
+    res.write(sse([{ type: "response.reasoning_summary_text.delta", delta: "repair-opened" }]));
+    held = res;
+    await new Promise((resolve) => res.once("close", resolve));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-repair-idle-optional-"));
+  const child = startForwarder(port, backend.port, writeSession(dir), {
+    CODEX_ROUTER_GROK_REPAIR_IDLE_MS: "200",
+  });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitHealth(base, child);
+    const resp = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        model: "grok-4.7",
+        messages: [{ role: "user", content: "continue the task" }],
+        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
+        stream: true,
+      }),
+    });
+    assert.equal(resp.status, 200);
+    const body = await Promise.race([
+      resp.text(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("silent optional repair was still open when the idle deadline passed")), 2_000)),
+    ]);
+    assert.equal(inbound, 2);
+    assert.match(body, /Short plan\./);
+    assert.match(body, /"finish_reason":"stop"/);
+    assert.doesNotMatch(body, /grok_repair_idle|event:\s*error/);
+    await waitChildError(child, /repair-idle=true/);
+  } finally {
+    held?.destroy();
+    await stop(child);
+    await new Promise((r) => backend.server.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("repair bytes more often than the idle still deliver the certified tool call", async () => {
+  let inbound = 0;
+  const backend = await mockBackend(async (_req, res) => {
+    inbound += 1;
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    if (inbound === 1) {
+      res.end(sse([
+        { type: "response.output_text.delta", delta: "Uncertified progress." },
+        { type: "response.completed", response: { usage: { input_tokens: 100, output_tokens: 20 } } },
+      ]));
+      return;
+    }
+    const args = JSON.stringify({ cmd: "kept-alive" });
+    res.flushHeaders();
+    // Incomplete SSE fragments carry bytes and no parsed event. Seven of them,
+    // 100ms apart, outlast a 300ms idle unless every byte restarts the timer.
+    const fragment = `event: response.reasoning_summary_text.delta\ndata: {"type":"response.reasoning_summary_text.delta","delta":"still"}`;
+    for (let index = 0; index < fragment.length; index += Math.ceil(fragment.length / 7)) {
+      res.write(fragment.slice(index, index + Math.ceil(fragment.length / 7)));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    res.end(`\n\n${sse([
+      { type: "response.output_item.added", item: { type: "function_call", id: "fc_live", call_id: "call_live", name: "exec_command" } },
+      { type: "response.function_call_arguments.delta", item_id: "fc_live", delta: args },
+      { type: "response.output_item.done", item: { type: "function_call", id: "fc_live", call_id: "call_live", name: "exec_command", arguments: args } },
+      { type: "response.completed", response: { status: "completed", usage: { input_tokens: 110, output_tokens: 30 } } },
+    ])}`);
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-repair-idle-reset-"));
+  const child = startForwarder(port, backend.port, writeSession(dir), {
+    CODEX_ROUTER_GROK_REPAIR_IDLE_MS: "300",
+  });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitHealth(base, child);
+    const resp = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({
+        model: "grok-4.7",
+        messages: [
+          { role: "assistant", tool_calls: [{ id: "c1", type: "function", function: { name: "exec_command", arguments: "{}" } }] },
+          { role: "tool", tool_call_id: "c1", content: "tool output" },
+        ],
+        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
+        stream: true,
+      }),
+    });
+    const body = await resp.text();
+    assert.equal(resp.status, 200);
+    assert.match(body, /kept-alive/);
+    assert.match(body, /"finish_reason":"tool_calls"/);
+    assert.doesNotMatch(body, /grok_repair_idle/);
+    assert.doesNotMatch(child.testErrors(), /repair-idle=true/);
+  } finally {
+    await stop(child);
+    await new Promise((r) => backend.server.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("aborting the client during a repair is not relabeled as repair idle", async () => {
+  let inbound = 0;
+  let held;
+  const backend = await mockBackend(async (_req, res) => {
+    inbound += 1;
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    if (inbound === 1) {
+      res.end(sse([
+        { type: "response.output_text.delta", delta: "Uncertified progress." },
+        { type: "response.completed", response: { usage: { input_tokens: 100, output_tokens: 20 } } },
+      ]));
+      return;
+    }
+    res.flushHeaders();
+    res.write(sse([{ type: "response.reasoning_summary_text.delta", delta: "repair-opened" }]));
+    held = res;
+    await new Promise((resolve) => res.once("close", resolve));
+  });
+  const port = await openPort();
+  const dir = mkdtempSync(path.join(os.tmpdir(), "grok-oauth-repair-idle-abort-"));
+  const child = startForwarder(port, backend.port, writeSession(dir), {
+    CODEX_ROUTER_GROK_REPAIR_IDLE_MS: "5000",
+  });
+  const base = `http://127.0.0.1:${port}`;
+  const client = new AbortController();
+  try {
+    await waitHealth(base, child);
+    const resp = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: auth,
+      signal: client.signal,
+      body: JSON.stringify({
+        model: "grok-4.7",
+        messages: [
+          { role: "assistant", tool_calls: [{ id: "c1", type: "function", function: { name: "exec_command", arguments: "{}" } }] },
+          { role: "tool", tool_call_id: "c1", content: "tool output" },
+        ],
+        tools: [{ type: "function", function: { name: "exec_command", parameters: { type: "object" } } }],
+        stream: true,
+      }),
+    });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+    const deadline = Date.now() + 2_000;
+    while (!body.includes("repair-opened")) {
+      if (Date.now() > deadline) throw new Error("repair body never started");
+      const { value, done } = await reader.read();
+      if (done) throw new Error("repair body ended before the client abort");
+      body += decoder.decode(value, { stream: true });
+    }
+    client.abort();
+    await reader.read().catch(() => {});
+    await waitChildError(child, /AbortError/);
+    assert.equal(inbound, 2);
+    assert.doesNotMatch(child.testErrors(), /repair-idle=true/);
+    assert.doesNotMatch(body, /grok_repair_idle/);
+  } finally {
+    client.abort();
+    held?.destroy();
+    await stop(child);
+    await new Promise((r) => backend.server.close(r));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 const V4A_GRAMMAR = [
   "start: begin_patch hunk+ end_patch",
   'begin_patch: "*** Begin Patch" LF',

@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- **A silent Grok OAuth repair no longer holds the Codex turn until the 10-minute stream stall.** The repair read ends after 120s without a byte (`CODEX_ROUTER_GROK_REPAIR_IDLE_MS`, `0` disables). A post-tool repair then writes one Chat Completions `data: {"error":...}` frame with code `grok_repair_idle` and no `[DONE]`. An optional repair keeps the first answer. The primary-attempt stall and the transport timeouts are unchanged.
 - **Grok OAuth chat streams no longer emit Responses `event: error` or empty-choice usage trailers.** LiteLLM translates this listener from Chat Completions to Responses and indexes `choices[0]` on every non-error chunk. A committed-head failure now writes `data: {"error":{message,type,code}}` and closes without `[DONE]`; usage rides on the finish-reason chunk. Direct `/v1/responses` to Codex still uses Responses `event: error`.
 - **An apostrophe in a harness config no longer moves the router's route into
   somebody else's value.** `yaml-structure.mjs` treated every `'` and `"` as a
