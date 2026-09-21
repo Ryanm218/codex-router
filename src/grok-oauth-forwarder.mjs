@@ -186,10 +186,12 @@ function messageContentParts(content, textType) {
   return parts.length ? parts : [{ type: textType, text: "" }];
 }
 
+const GROK_XHIGH_MODELS = new Set(["grok-4.6", "grok-4.7"]);
+
 function mapEffort(effort, model) {
   if (effort === "minimal") return "low";
   if (["none", "low"].includes(effort)) return "low";
-  if (effort === "xhigh") return model === "grok-4.6" ? "xhigh" : "high";
+  if (effort === "xhigh") return GROK_XHIGH_MODELS.has(model) ? "xhigh" : "high";
   if (effort === "max") return "high";
   return ["medium", "high"].includes(effort) ? effort : undefined;
 }
