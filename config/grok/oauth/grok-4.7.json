@@ -30,7 +30,7 @@
         }
       ],
       "contextWindow": 500000,
-      "autoCompact": 440000,
+      "autoCompact": 360000,
       "inputModalities": [
         "text",
         "image"
@@ -43,7 +43,7 @@
       },
       "supportsImageDetailOriginal": true,
       "availabilityNux": "Grok 4.7 is available through the official Grok CLI OAuth session.",
-      "compHash": "grok-oauth-grok-4-7-v1"
+      "compHash": "grok-oauth-grok-4-7-v2"
     }
   ]
 }

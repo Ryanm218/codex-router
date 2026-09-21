@@ -30,8 +30,14 @@ test("every Grok 4.6 route records the upstream id and window", () => {
     assert.equal(model.listed, true);
     // The official window is 500,000 tokens.
     assert.equal(model.contextWindow, 500_000);
-    // autoCompact sits below the hard limit.
-    assert.ok(model.autoCompact >= 440_000 && model.autoCompact <= 450_000);
+    // Codex compacts at autoCompact. The OAuth hop compacts at 360k because a
+    // 440k thread stalled under that line and only compacted on a model switch.
+    // The other 4.6 routes keep the near-window pin.
+    if (slug === "grok-oauth/grok-4.6") {
+      assert.equal(model.autoCompact, 360_000);
+    } else {
+      assert.ok(model.autoCompact >= 440_000 && model.autoCompact <= 450_000);
+    }
   }
 });
 
