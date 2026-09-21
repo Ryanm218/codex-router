@@ -715,12 +715,15 @@ test("provider registry exposes configured API and OAuth model families", () => 
     grok46.reasoningLevels.map((level) => level.effort),
     ["low", "medium", "high", "xhigh"],
   );
+  assert.equal(grok46.autoCompact, 360_000);
+  assert.equal(grok46.compHash, "grok-oauth-grok-4-6-v2");
   assert.equal(grok46.defaultEffort, "high");
   assert.deepEqual(grok46.inputModalities, ["text", "image"]);
   const grok47 = MODEL_BY_SLUG.get("grok-oauth/grok-4.7");
   assert.equal(grok47.upstreamModel, "grok-4.7");
   assert.equal(grok47.contextWindow, 500_000);
-  assert.equal(grok47.autoCompact, 440_000);
+  assert.equal(grok47.autoCompact, 360_000);
+  assert.equal(grok47.compHash, "grok-oauth-grok-4-7-v2");
   assert.equal(grok47.defaultEffort, "high");
   assert.equal(grok47.serviceTiers, undefined);
   assert.deepEqual(
