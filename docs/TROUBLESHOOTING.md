@@ -433,6 +433,16 @@ and response content are never logged. To disable the invariant and see the
 raw first attempt, set `CODEX_ROUTER_GROK_PROGRESS_ONLY_RETRY=0`; this kill
 switch is intentionally unsafe for unattended tool loops.
 
+A streamed repair writes `reasoning_content` as it arrives, including an
+optional repair that is later discarded. Discarding that repair does not
+remove reasoning already sent. Visible repair text and tool calls stay
+withheld until the repair is classified, and a discarded repair still omits
+them. A fetch that throws before response headers is sent once more, with a
+new `x-grok-req-id`, and logged as `upstream-preheader-retry=true`. That
+second POST can bill another generation when xAI accepted the first and the
+headers never arrived. A caller abort, a failure after headers, and a second
+transport failure are not sent again.
+
 The router holds the entire response until it knows the turn produced something.
 When nothing arrives it discards that attempt and retries the identical request
 once, so the client sees only one response head, response ID, and sequence space.

@@ -48,6 +48,7 @@ import { knownServiceTier } from "./request-diagnostics.mjs";
 import { VERSION } from "./version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 import { grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
+import { isRetryableTransportError } from "./upstream-retry.mjs";
 
 // This process carries only Grok traffic, so its whole pool outlasts the
 // router's stall guard. Undici's 300s default would otherwise end a long
@@ -607,7 +608,7 @@ async function handleChatCompletions(request, response) {
     if (!response.writableEnded) controller.abort();
   });
 
-  const requestUpstream = async (accessToken, body) => {
+  const requestUpstreamOnce = async (accessToken, body) => {
     const attempt = {
       requestId: randomUUID(),
       startedAt: Date.now(),
@@ -631,6 +632,23 @@ async function handleChatCompletions(request, response) {
         }
       }
       throw error;
+    }
+  };
+  // One new fetch when the first dies before response headers. xAI may already
+  // have accepted that POST, so the retry can bill a second generation. A
+  // caller abort, a post-header failure, and a second transport failure are
+  // not sent again.
+  const requestUpstream = async (accessToken, body, phase = "attempt") => {
+    try {
+      return await requestUpstreamOnce(accessToken, body);
+    } catch (error) {
+      if (controller.signal.aborted || !isRetryableTransportError(error)) throw error;
+      if (error?.grokUpstreamAttempt?.headersAt) throw error;
+      const cause = error?.cause?.code || error?.code || "none";
+      console.error(
+        `[grok-oauth] upstream-preheader-retry=true phase=${phase} model=${model} error=${error?.name || "Error"} cause=${cause}`,
+      );
+      return await requestUpstreamOnce(accessToken, body);
     }
   };
   let accessToken;
@@ -817,7 +835,7 @@ async function handleChatCompletions(request, response) {
     const retryRequest = toResponsesRequest(retryChat, { hostedSearchEnabled });
     let secondUpstream;
     try {
-      repairAttempt = await requestUpstream(accessToken, retryRequest);
+      repairAttempt = await requestUpstream(accessToken, retryRequest, "repair");
       secondUpstream = repairAttempt.response;
     } catch (error) {
       repairAttempt = error?.grokUpstreamAttempt;
@@ -847,7 +865,10 @@ async function handleChatCompletions(request, response) {
         await consumeResponsesStream(secondUpstream.body, (event) => {
           repairAttempt.firstEventAt ??= Date.now();
           applyResponsesEvent(secondState, event);
-          if (wantsStream && streamStarted && strictAfterToolRepair) {
+          // Reasoning keeps the router's stall timer reset while content and
+          // tool calls stay withheld until the repair is classified. A discarded
+          // optional repair does not unsend reasoning already written.
+          if (wantsStream && streamStarted) {
             while (emittedRepairDeltaCount < secondState.deltas.length) {
               const delta = secondState.deltas[emittedRepairDeltaCount];
               if (Object.hasOwn(delta, "reasoning_content")) {
