@@ -5,6 +5,7 @@
 // pause ends at whichever hop times out first. All of them are computed here
 // from the one service environment every child process inherits.
 export const DEFAULT_GROK_STREAM_STALL_MS = 10 * 60_000;
+export const DEFAULT_GROK_REPAIR_IDLE_MS = 120_000;
 export const GROK_TRANSPORT_MARGIN_MS = 60_000;
 
 // Undici's default body idle bound and the gateway's configured request
@@ -15,6 +16,22 @@ const LITELLM_REQUEST_TIMEOUT_MS = 600_000;
 // Node clamps a larger timer delay to 1ms, which would end every Grok turn at
 // its first reasoning event.
 const MAX_TIMER_MS = 2_147_483_647;
+
+// Byte gap on a progress-only repair read. This is shorter than the primary
+// stall on purpose: a repair withholds the answer, so silence is a failure
+// rather than a reasoning pause. It does not change the transport or gateway
+// bounds. Zero disables it and leaves the stall as the only backstop.
+export function grokRepairIdleMs(environment = process.env) {
+  if (!Object.hasOwn(environment, "CODEX_ROUTER_GROK_REPAIR_IDLE_MS")) {
+    return DEFAULT_GROK_REPAIR_IDLE_MS;
+  }
+  const raw = environment.CODEX_ROUTER_GROK_REPAIR_IDLE_MS;
+  if (raw === 0 || raw === "0") return 0;
+  const configured = Number(raw);
+  return Number.isFinite(configured) && configured > 0 && configured <= MAX_TIMER_MS
+    ? configured
+    : DEFAULT_GROK_REPAIR_IDLE_MS;
+}
 
 export function grokStreamStallMs(environment = process.env) {
   const configured = Number(

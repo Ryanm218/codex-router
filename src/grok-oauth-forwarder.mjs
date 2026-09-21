@@ -47,7 +47,7 @@ import {
 import { knownServiceTier } from "./request-diagnostics.mjs";
 import { VERSION } from "./version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
-import { grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
+import { grokRepairIdleMs, grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
 import { isRetryableTransportError } from "./upstream-retry.mjs";
 
 // This process carries only Grok traffic, so its whole pool outlasts the
@@ -519,12 +519,47 @@ function dispatchSseBlock(rawEvent, handlers) {
   return TERMINAL_RESPONSES_EVENTS.has(event?.type);
 }
 
-async function consumeResponsesStream(upstreamBody, handlers) {
+function grokRepairIdleError() {
+  const error = new Error(
+    "Grok's repair stopped sending output before the repair idle deadline.",
+  );
+  error.name = "GrokRepairIdleError";
+  error.code = "grok_repair_idle";
+  return error;
+}
+
+// Settle the idle rejection before canceling the reader. A cancel can resolve
+// the pending read as EOF, and that result must not replace the idle error.
+function readUpstreamChunk(reader, idleMs) {
+  if (!idleMs) return reader.read();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (settle, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      settle(value);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(grokRepairIdleError());
+      reader.cancel().catch(() => {});
+    }, idleMs);
+    timer.unref?.();
+    reader.read().then(
+      (result) => finish(resolve, result),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
+async function consumeResponsesStream(upstreamBody, handlers, { idleMs = 0 } = {}) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   for (;;) {
-    const { value, done } = await reader.read();
+    const { value, done } = await readUpstreamChunk(reader, idleMs);
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
     let boundary;
@@ -857,10 +892,12 @@ async function handleChatCompletions(request, response) {
         };
       }
     } else if (secondUpstream?.body) {
+      const repairIdleMs = grokRepairIdleMs();
       const secondState = createTurnState({
         toolNameMapper: (name) => toolNameForCodex(name, { viewImageAlias }),
       });
       let emittedRepairDeltaCount = 0;
+      let repairIdle = false;
       try {
         await consumeResponsesStream(secondUpstream.body, (event) => {
           repairAttempt.firstEventAt ??= Date.now();
@@ -877,13 +914,29 @@ async function handleChatCompletions(request, response) {
               emittedRepairDeltaCount += 1;
             }
           }
-        });
+        }, { idleMs: repairIdleMs });
         repairAttempt.endedAt = Date.now();
       } catch (error) {
         repairAttempt.endedAt = Date.now();
-        logUpstreamPhaseFailure("repair", model, repairAttempt, error);
-        throw error;
+        if (error?.name === "GrokRepairIdleError" && !controller.signal.aborted) {
+          repairIdle = true;
+          console.error(
+            `[grok-oauth] repair-idle=true model=${model} idle_ms=${repairIdleMs} ${upstreamAttemptTiming("repair", repairAttempt)}`,
+          );
+        } else {
+          logUpstreamPhaseFailure("repair", model, repairAttempt, error);
+          throw error;
+        }
       }
+      if (repairIdle) {
+        if (strictAfterToolRepair) {
+          repairFailure = {
+            code: "grok_repair_idle",
+            message:
+              "Grok's repair stopped sending output, so the router ended it instead of waiting out the stream stall.",
+          };
+        }
+      } else {
       const second = finalizeTurn(secondState);
       // Keep both client tools and the private final answer withheld until
       // response.completed. An item.done followed by EOF/failure is not a
@@ -958,6 +1011,7 @@ async function handleChatCompletions(request, response) {
         };
       } else {
         turn = { ...turn, usage: mergeMappedUsage(turn.usage, second.usage), serviceTier: undefined, serviceTierUnknown: false };
+      }
       }
     } else if (strictAfterToolRepair) {
       repairFailure = {
