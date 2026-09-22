@@ -48,6 +48,12 @@ import { knownServiceTier } from "./request-diagnostics.mjs";
 import { VERSION } from "./version.mjs";
 import { installStableFetchTransport } from "./fetch-transport.mjs";
 import { grokRepairIdleMs, grokTransportIdleTimeoutMs } from "./grok-stream-timeouts.mjs";
+import {
+  GROK_REPAIR_STALL_KEEPALIVE,
+  grokRepairKeepaliveMs,
+  repairChunkResetsIdle,
+  repairKeepaliveDue,
+} from "./grok-repair-keepalive.mjs";
 import { isRetryableTransportError } from "./upstream-retry.mjs";
 
 // This process carries only Grok traffic, so its whole pool outlasts the
@@ -554,14 +560,27 @@ function readUpstreamChunk(reader, idleMs) {
   });
 }
 
-async function consumeResponsesStream(upstreamBody, handlers, { idleMs = 0 } = {}) {
+async function consumeResponsesStream(upstreamBody, handlers, {
+  idleMs = 0,
+  progressIdle = false,
+  onIdleReset,
+} = {}) {
   const reader = upstreamBody.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let deadline = idleMs ? Date.now() + idleMs : 0;
+  const remaining = () => (idleMs ? Math.max(0, deadline - Date.now()) : 0);
   for (;;) {
-    const { value, done } = await readUpstreamChunk(reader, idleMs);
+    const wait = progressIdle ? remaining() : idleMs;
+    if (progressIdle && idleMs && wait === 0) throw grokRepairIdleError();
+    const { value, done } = await readUpstreamChunk(reader, wait);
     if (done) break;
+    const previous = buffer;
     buffer += decoder.decode(value, { stream: true });
+    if (progressIdle && repairChunkResetsIdle(previous, buffer)) {
+      if (idleMs) deadline = Date.now() + idleMs;
+      onIdleReset?.(previous, buffer);
+    }
     let boundary;
     while ((boundary = nextSseBoundary(buffer))) {
       const rawEvent = buffer.slice(0, boundary.at);
@@ -893,11 +912,24 @@ async function handleChatCompletions(request, response) {
       }
     } else if (secondUpstream?.body) {
       const repairIdleMs = grokRepairIdleMs();
+      const repairKeepaliveGapMs = grokRepairKeepaliveMs();
       const secondState = createTurnState({
         toolNameMapper: (name) => toolNameForCodex(name, { viewImageAlias }),
       });
       let emittedRepairDeltaCount = 0;
       let repairIdle = false;
+      let lastRepairKeepaliveAt = 0;
+      const writeRepairKeepalive = () => {
+        if (!wantsStream || !streamStarted) return;
+        const now = Date.now();
+        if (repairKeepaliveGapMs > 0 && lastRepairKeepaliveAt && now - lastRepairKeepaliveAt < repairKeepaliveGapMs) {
+          return;
+        }
+        lastRepairKeepaliveAt = now;
+        response.write(OPENAI_ROLE_CHUNK(id, created, model, {
+          reasoning_content: GROK_REPAIR_STALL_KEEPALIVE,
+        }));
+      };
       try {
         await consumeResponsesStream(secondUpstream.body, (event) => {
           repairAttempt.firstEventAt ??= Date.now();
@@ -914,7 +946,13 @@ async function handleChatCompletions(request, response) {
               emittedRepairDeltaCount += 1;
             }
           }
-        }, { idleMs: repairIdleMs });
+        }, {
+          idleMs: repairIdleMs,
+          progressIdle: true,
+          onIdleReset: (previous, next) => {
+            if (repairKeepaliveDue(previous, next)) writeRepairKeepalive();
+          },
+        });
         repairAttempt.endedAt = Date.now();
       } catch (error) {
         repairAttempt.endedAt = Date.now();

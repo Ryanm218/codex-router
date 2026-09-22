@@ -398,14 +398,20 @@ is correct." is not talked into a call the client would then run. Raise
 `CODEX_ROUTER_GROK_PROGRESS_ONLY_MAX_TEXT` to fire less often on that
 user-message path; those settings do not weaken the post-tool invariant.
 
-A repair that stops sending bytes is a different failure from a slow primary
+A repair that stops making progress is a different failure from a slow primary
 attempt. The forwarder ends that second read after
 `CODEX_ROUTER_GROK_REPAIR_IDLE_MS` (default 120s; `0` leaves only the
-10-minute stall). Every received byte restarts the idle. The post-tool path
-then writes `grok_repair_idle` as a Chat Completions `data: {"error":...}`
-frame and does not release the held progress sentence. The user-message path
-keeps the first answer. A client disconnect is still an abort, not this code.
-The log line is `repair-idle=true`.
+10-minute stall) measured from the last parsed progress event, or from an
+incomplete tail that already names one. Comments and `response.in_progress`
+do not restart it. A withheld tool call, final answer, or unfinished progress
+frame also writes U+2060 on `reasoning_content` at most once per
+`CODEX_ROUTER_GROK_REPAIR_KEEPALIVE_MS` (default 30s; `0` writes one per
+event) so the router stall stays reset until `response.completed`. The router
+rewrites that character to `response.in_progress` and does not store it. The
+post-tool path then writes `grok_repair_idle` as a Chat Completions
+`data: {"error":...}` frame and does not release the held progress sentence.
+The user-message path keeps the first answer. A client disconnect is still an
+abort, not this code. The log line is `repair-idle=true`.
 
 For a quiet worker, run `bin/control activity <thread-id>` from the installed
 checkout (on Windows, `codex-router.ps1 activity <thread-id>` from

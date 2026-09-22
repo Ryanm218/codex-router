@@ -80,6 +80,7 @@ import {
 } from "./grok-tool-facade.mjs";
 import { applyGrokFileToolsOverlay } from "./instruction-overlays.mjs";
 import { ResponsesHeartbeatTransform } from "./responses-heartbeat.mjs";
+import { GrokRepairKeepaliveTransform } from "./grok-repair-keepalive.mjs";
 import { messagePhaseTransform } from "./message-phase.mjs";
 import { translatedToolMessageCompatTransform } from "./deepseek-tool-message-compat.mjs";
 import {
@@ -4665,6 +4666,12 @@ async function handleResponses(request, response, requestUrl) {
             : undefined,
       });
       const transforms = [activity.progress.byteObserver(), usageObserver];
+      if (
+        isGrokOauthRoute(route) &&
+        String(contentType).toLowerCase().includes("text/event-stream")
+      ) {
+        transforms.unshift(new GrokRepairKeepaliveTransform());
+      }
       let envelopeCompat = route
         ? zaiResponsesCompatTransform(route.provider, contentType)
         : undefined;
